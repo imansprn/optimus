@@ -20,7 +20,6 @@ var (
     target      = flag.String("target", "127.0.0.1:9878", "Gateway address")
     connections = flag.Int("c", 100, "Number of concurrent connections")
     symbol      = flag.String("symbol", "EUR/USD", "Symbol to subscribe to")
-    duration    = flag.Duration("d", 30*time.Second, "Test duration")
 )
 
 func main() {
@@ -102,14 +101,18 @@ func runClient(ctx context.Context, id int, activeCounter, tickCounter *int64) e
     logon.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
     logon.AddField(fix.TagEncryptMethod, "0")
     logon.AddField(fix.TagHeartBtInt, "30")
-    conn.Write(fix.Serialize(logon))
+    if _, err := conn.Write(fix.Serialize(logon)); err != nil {
+        return err
+    }
 
     // 2. Subscribe
     sub := fix.NewMessage(fix.MsgTypeMarketDataRequest)
     sub.AddField(fix.TagMDReqID, fmt.Sprintf("REQ_%d", id))
     sub.AddField(fix.TagSubscriptionRequestType, "1")
     sub.AddField(fix.TagSymbol, *symbol)
-    conn.Write(fix.Serialize(sub))
+    if _, err := conn.Write(fix.Serialize(sub)); err != nil {
+        return err
+    }
 
     // 3. Read loop
     buf := make([]byte, 4096)
@@ -118,7 +121,9 @@ func runClient(ctx context.Context, id int, activeCounter, tickCounter *int64) e
         case <-ctx.Done():
             return nil
         default:
-            conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+            if err := conn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+                return err
+            }
             n, err := conn.Read(buf)
             if err != nil {
                 if netErr, ok := err.(net.Error); ok && netErr.Timeout() {

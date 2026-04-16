@@ -23,7 +23,9 @@ func TestEndToEnd(t *testing.T) {
 
     // 1. Start Mock PrimeXM
     mock := testutil.NewMockPrimeXM(mockAddr)
-    go mock.Start(ctx)
+    if err := mock.Start(ctx); err != nil {
+        t.Fatalf("Failed to start mock: %v", err)
+    }
     time.Sleep(100 * time.Millisecond) // Wait for start
 
     // 2. Start Gateway
@@ -34,7 +36,9 @@ func TestEndToEnd(t *testing.T) {
     acceptor := session.NewAcceptor(gwAddr, "GW_GATEWAY", nil, r.OnClientSubscribe)
     
     upstream.Start(ctx)
-    go acceptor.Start(ctx)
+    if err := acceptor.Start(ctx); err != nil {
+        t.Fatalf("Failed to start acceptor: %v", err)
+    }
     time.Sleep(500 * time.Millisecond) // Wait for logon
 
     // 3. Connect Client
@@ -52,7 +56,9 @@ func TestEndToEnd(t *testing.T) {
     logon.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
     logon.AddField(fix.TagEncryptMethod, "0")
     logon.AddField(fix.TagHeartBtInt, "30")
-    conn.Write(fix.Serialize(logon))
+    if _, err := conn.Write(fix.Serialize(logon)); err != nil {
+		t.Fatalf("Failed to send logon: %v", err)
+	}
 
     // Wait for logon ack
     buf := make([]byte, 1024)
@@ -66,11 +72,15 @@ func TestEndToEnd(t *testing.T) {
     sub.AddField(fix.TagMDReqID, "SUB01")
     sub.AddField(fix.TagSubscriptionRequestType, "1")
     sub.AddField(fix.TagSymbol, "EUR/USD")
-    conn.Write(fix.Serialize(sub))
+    if _, err := conn.Write(fix.Serialize(sub)); err != nil {
+		t.Fatalf("Failed to send subscribe: %v", err)
+	}
 
     // 6. Verify Quote Received
     // Mock streams every 1s
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+    if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("Failed to set read deadline: %v", err)
+	}
     n, err = conn.Read(buf)
     if err != nil {
         t.Fatalf("Failed to read quote: %v", err)

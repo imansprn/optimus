@@ -28,13 +28,12 @@ type SymbolSubscription struct {
 type Router struct {
     symbols     sync.Map // string (symbol) -> *SymbolSubscription
     reqIDToSym  sync.Map // string (upstreamReqID) -> string (symbol)
-    sessions    sync.Map // string (sessionID) -> *session.ClientSession
-    upstream    *session.UpstreamSession
-    
+    upstream   *session.UpstreamSession
+
     books       sync.Map // string (symbol) -> *quote.QuoteBook
-    
+
     upstreamSeq int64
-    
+
     unsubDelay  time.Duration
     pendingUnsub sync.Map // string (symbol) -> *time.Timer
 }
@@ -262,7 +261,9 @@ func (r *Router) sendUpstreamSubscribe(ss *SymbolSubscription) {
     msg.AddField(fix.TagSymbol, ss.Symbol)
 
     log.Info().Str("symbol", ss.Symbol).Str("upstream_req_id", reqID).Msg("Sending upstream subscription")
-    r.upstream.Send(msg)
+    if err := r.upstream.Send(msg); err != nil {
+        log.Error().Err(err).Msg("Failed to send upstream subscription")
+    }
 }
 
 func (r *Router) sendUpstreamUnsubscribe(ss *SymbolSubscription) {
@@ -277,7 +278,9 @@ func (r *Router) sendUpstreamUnsubscribe(ss *SymbolSubscription) {
     msg.AddField(fix.TagSymbol, ss.Symbol)
 
     log.Info().Str("symbol", ss.Symbol).Str("upstream_req_id", ss.UpstreamReqID).Msg("Sending upstream unsubscription")
-    r.upstream.Send(msg)
+    if err := r.upstream.Send(msg); err != nil {
+        log.Error().Err(err).Msg("Failed to send upstream unsubscription")
+    }
     ss.UpstreamReqID = ""
 }
 

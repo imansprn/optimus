@@ -6,6 +6,8 @@ import (
     "os"
     "path/filepath"
     "sync"
+
+    "github.com/rs/zerolog/log"
 )
 
 type SequenceStore struct {
@@ -19,7 +21,9 @@ type SessionStateData struct {
 }
 
 func NewSequenceStore(dir string) *SequenceStore {
-    os.MkdirAll(dir, 0755)
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        log.Error().Err(err).Msg("Failed to create sequence store directory")
+    }
     return &SequenceStore{path: dir}
 }
 

@@ -22,5 +22,9 @@ config.toml
 .idea/
 .vscode/
 
-# Project specifics
-gateway
+# Go Version Manager
+.gvm/
+
+# Go
+go/
+bin/

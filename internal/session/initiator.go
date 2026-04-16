@@ -153,11 +153,13 @@ func (s *UpstreamSession) Send(msg *fix.Message) error {
     }
 
     data := fix.Serialize(msg)
-    
+
     // Increment and save outSeq
     out := atomic.LoadInt64(&s.outSeqNum)
     in := atomic.LoadInt64(&s.inSeqNum)
-    s.store.Save(s.senderCompID, s.targetCompID, in, out)
+    if err := s.store.Save(s.senderCompID, s.targetCompID, in, out); err != nil {
+        log.Error().Err(err).Msg("Failed to save sequence")
+    }
 
     // Redact sensitive tags for logging
     logStr := string(data)
@@ -180,7 +182,10 @@ func (s *UpstreamSession) readLoop(ctx context.Context) {
     scanner.Split(fix.SplitFixMessage)
     
     for scanner.Scan() {
-        s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second))
+        if err := s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
+            log.Error().Err(err).Msg("Failed to set read deadline")
+            return
+        }
         data := scanner.Bytes()
         
         msg, err := fix.Parse(data)
@@ -203,7 +208,9 @@ func (s *UpstreamSession) readLoop(ctx context.Context) {
 func (s *UpstreamSession) handleMessage(msg *fix.Message) {
     in := atomic.AddInt64(&s.inSeqNum, 1)
     out := atomic.LoadInt64(&s.outSeqNum)
-    s.store.Save(s.senderCompID, s.targetCompID, in, out)
+    if err := s.store.Save(s.senderCompID, s.targetCompID, in, out); err != nil {
+        log.Error().Err(err).Msg("Failed to save sequence")
+    }
 
     log.Trace().Str("msg_type", msg.MsgType).Int64("seq", in).Msg("Upstream message received")
     
@@ -219,7 +226,9 @@ func (s *UpstreamSession) handleMessage(msg *fix.Message) {
         testReqID, _ := msg.GetField(fix.TagTestReqID)
         hb := fix.NewMessage(fix.MsgTypeHeartbeat)
         hb.AddField(fix.TagTestReqID, testReqID)
-        s.Send(hb)
+        if err := s.Send(hb); err != nil {
+            log.Error().Err(err).Msg("Failed to send test request response")
+        }
     case fix.MsgTypeMassQuote:
         if quoteID, ok := msg.GetField(fix.TagQuoteID); ok {
             ack := fix.NewMessage(fix.MsgTypeMassQuoteAck)
@@ -228,7 +237,9 @@ func (s *UpstreamSession) handleMessage(msg *fix.Message) {
             ack.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&s.outSeqNum, 1), 10))
             ack.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
             ack.AddField(fix.TagQuoteID, quoteID)
-            s.Send(ack)
+            if err := s.Send(ack); err != nil {
+                log.Error().Err(err).Msg("Failed to send quote ack")
+            }
         }
         if s.onMsg != nil {
             s.onMsg(msg)
@@ -264,11 +275,4 @@ func (s *UpstreamSession) heartbeatLoop() {
         }
         log.Trace().Msg("Upstream heartbeat sent")
     }
-}
-
-func min(a, b time.Duration) time.Duration {
-    if a < b {
-        return a
-    }
-    return b
 }

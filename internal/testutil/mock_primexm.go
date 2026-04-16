@@ -97,7 +97,9 @@ func (m *MockPrimeXM) sendAck(conn net.Conn, msgType string) {
     msg := fix.NewMessage(msgType)
     msg.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&m.outSeq, 1), 10))
     msg.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
-    conn.Write(fix.Serialize(msg))
+    if _, err := conn.Write(fix.Serialize(msg)); err != nil {
+		log.Error().Err(err).Msg("Failed to send ack")
+	}
 }
 
 func (m *MockPrimeXM) streamLoop(ctx context.Context) {
@@ -131,7 +133,9 @@ func (m *MockPrimeXM) streamLoop(ctx context.Context) {
                 data := fix.Serialize(msg)
                 m.sessions.Range(func(key, value interface{}) bool {
                     conn := value.(net.Conn)
-                    conn.Write(data)
+                    if _, err := conn.Write(data); err != nil {
+                        log.Error().Err(err).Msg("Failed to send quote")
+                    }
                     return true
                 })
                 return true

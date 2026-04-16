@@ -1,6 +1,11 @@
-# optimus: PrimeXM-Compatible FIX Market Data Gateway
+# Optimus: PrimeXM-Compatible FIX Market Data Gateway
 
-**optimus** is a high-performance, FIX 4.4-native market data gateway and splitter designed specifically for PrimeXM pricing streams. It allows multiple downstream consumers to share a single canonical upstream PrimeXM pricing session, reducing costs and operational complexity.
+[![Continuous Integration](https://github.com/imansprn/optimus/actions/workflows/ci.yml/badge.svg)](https://github.com/imansprn/optimus/actions/workflows/ci.yml)
+[![Docker Build](https://github.com/imansprn/optimus/actions/workflows/docker.yml/badge.svg)](https://github.com/imansprn/optimus/actions/workflows/docker.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/imansprn/optimus.svg)](https://pkg.go.dev/github.com/imansprn/optimus)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+**Optimus** is a high-performance, FIX 4.4-native market data gateway and splitter designed specifically for PrimeXM pricing streams. It allows multiple downstream consumers to share a single canonical upstream PrimeXM pricing session, reducing costs and operational complexity.
 
 ## Key Features
 

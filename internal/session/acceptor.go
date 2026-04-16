@@ -22,7 +22,6 @@ type ClientSession struct {
     TargetCompID  string
     conn          net.Conn
     outboundCh    chan []byte
-    inSeqNum      int64
     outSeqNum     int64
     heartBtInt    int
     lastRecv      time.Time
@@ -94,7 +93,11 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
     scanner.Split(fix.SplitFixMessage)
 
     // Read first message (Logon)
-    conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+    if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+        log.Error().Err(err).Msg("Failed to set read deadline")
+        conn.Close()
+        return
+    }
     if !scanner.Scan() {
         if err := scanner.Err(); err != nil {
             log.Error().Err(err).Msg("Initial read error")
@@ -153,7 +156,11 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
 
     // Main read loop
     for scanner.Scan() {
-        conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second))
+        if err := conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
+            s.logger.Error().Err(err).Msg("Failed to set read deadline")
+            s.cancel()
+            return
+        }
         data := scanner.Bytes()
         s.logger.Trace().Int("len", len(data)).Msg("Raw data received from client")
 
@@ -194,7 +201,11 @@ func (s *ClientSession) writeLoop(ctx context.Context) {
             s.conn.Close()
             return
         case data := <-s.outboundCh:
-            s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+            if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+                s.logger.Error().Err(err).Msg("Failed to set write deadline")
+                s.cancel()
+                return
+            }
             _, err := s.conn.Write(data)
             if err != nil {
                 s.logger.Error().Err(err).Msg("Client write error")
