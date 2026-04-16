@@ -1,0 +1,22 @@
+# optimus Configuration Example
+
+# Upstream PrimeXM pricing session settings
+upstream_host: "pricing.primexm.com"
+upstream_port: 9879
+upstream_sender: "GW01"     # Provided by PrimeXM (Tag 49)
+upstream_target: "PXMD"     # Provided by PrimeXM (Tag 56)
+upstream_user: "your_user"  # Provided by PrimeXM (Tag 553)
+upstream_pass: "your_pass"  # Provided by PrimeXM (Tag 554)
+
+# Gateway listener settings
+listen_addr: "0.0.0.0:9878"
+acceptor_sender: "GW_GATEWAY" # Your ID presented to downstream clients
+
+# Logging settings
+log_level: "info"             # debug, info, warn, error, fatal, panic, trace
+log_format: "console"          # console, json
+
+# Tips:
+# 1. Any of these can be overridden by environment variables prefixed with optimus_
+#    e.g. optimus_UPSTREAM_USER=admin
+# 2. Sequence numbers are reset to 1 on every logon by default.
