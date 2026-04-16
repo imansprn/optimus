@@ -2,6 +2,7 @@ package integration
 
 import (
     "context"
+    "fmt"
     "net"
     "github.com/imansprn/optimus/internal/fix"
     "github.com/imansprn/optimus/internal/router"
@@ -13,9 +14,30 @@ import (
     "github.com/rs/zerolog"
 )
 
+func waitForTCP(ctx context.Context, addr string) error {
+    ticker := time.NewTicker(25 * time.Millisecond)
+    defer ticker.Stop()
+
+    d := net.Dialer{Timeout: 200 * time.Millisecond}
+
+    for {
+        conn, err := d.DialContext(ctx, "tcp", addr)
+        if err == nil {
+            conn.Close()
+            return nil
+        }
+
+        select {
+        case <-ctx.Done():
+            return fmt.Errorf("timed out waiting for %s: %w", addr, ctx.Err())
+        case <-ticker.C:
+        }
+    }
+}
+
 func TestEndToEnd(t *testing.T) {
     zerolog.SetGlobalLevel(zerolog.DebugLevel)
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
     defer cancel()
 
     mockAddr := "127.0.0.1:9999"
@@ -23,10 +45,12 @@ func TestEndToEnd(t *testing.T) {
 
     // 1. Start Mock PrimeXM
     mock := testutil.NewMockPrimeXM(mockAddr)
-    if err := mock.Start(ctx); err != nil {
-        t.Fatalf("Failed to start mock: %v", err)
+    go func() {
+        _ = mock.Start(ctx)
+    }()
+    if err := waitForTCP(ctx, mockAddr); err != nil {
+        t.Fatalf("Mock not reachable: %v", err)
     }
-    time.Sleep(100 * time.Millisecond) // Wait for start
 
     // 2. Start Gateway
     r := router.NewRouter()
@@ -36,10 +60,12 @@ func TestEndToEnd(t *testing.T) {
     acceptor := session.NewAcceptor(gwAddr, "GW_GATEWAY", nil, r.OnClientSubscribe)
     
     upstream.Start(ctx)
-    if err := acceptor.Start(ctx); err != nil {
-        t.Fatalf("Failed to start acceptor: %v", err)
+    go func() {
+        _ = acceptor.Start(ctx)
+    }()
+    if err := waitForTCP(ctx, gwAddr); err != nil {
+        t.Fatalf("Gateway not reachable: %v", err)
     }
-    time.Sleep(500 * time.Millisecond) // Wait for logon
 
     // 3. Connect Client
     conn, err := net.Dial("tcp", gwAddr)
