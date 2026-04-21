@@ -1,112 +1,85 @@
 package quote
 
 import (
-    "github.com/imansprn/optimus/internal/fix"
-    "github.com/imansprn/optimus/internal/metrics"
-    "github.com/imansprn/optimus/internal/session"
-    "strconv"
+	"strconv"
 
-    "github.com/rs/zerolog/log"
+	"github.com/imansprn/optimus/internal/fix"
+	"github.com/imansprn/optimus/internal/metrics"
+	"github.com/imansprn/optimus/internal/session"
+	"github.com/rs/zerolog/log"
 )
 
-type Engine struct {
-    books map[string]*QuoteBook
-}
+// Engine handles fan-out of market data to downstream clients.
+type Engine struct{}
 
-func NewEngine() *Engine {
-    return &Engine{
-        books: make(map[string]*QuoteBook),
-    }
-}
+func NewEngine() *Engine { return &Engine{} }
 
-// ProcessUpstreamQuote handles MsgType=i (Mass Quote) from PrimeXM.
-func (e *Engine) ProcessUpstreamQuote(msg *fix.Message, getClients func(string) []ClientSub) {
-    // 302 represents the upstream MDReqID. 
-    // We need to map it back to the symbol.
-    // But in Mass Quote, 302 is inside QuoteSets.
-    
-    // For simplicity in this engine, we assume the router has already mapped 302 -> symbol.
-    // Actually, the engine shouldn't know about Router specifics.
-    // Let's assume the msg passed here is already identified by Symbol.
-}
-
+// ClientSub represents a downstream client subscription.
 type ClientSub struct {
-    Session     *session.ClientSession
-    ClientReqID string
+	Session     *session.ClientSession
+	ClientReqID string
 }
 
-// FanOut sends a Mass Quote to all interested clients.
-func FanOut(symbol string, book *QuoteBook, subscribers []ClientSub) {
-    if len(subscribers) == 0 {
-        return
-    }
+// FanOut sends a MassQuote (35=i) to all subscribers, serializing once per client
+// so that each client receives their own MDReqID without padding artifacts.
+func (e *Engine) FanOut(symbol string, book *QuoteBook, subscribers []ClientSub) {
+	if len(subscribers) == 0 {
+		return
+	}
 
-    // Reconstruct Mass Quote from book
-    // Note: PrimeXM spec says 35=i for updates.
-    // We'll build a 35=i template.
-    
-    base := fix.NewMessage(fix.MsgTypeMassQuote)
-    base.AddField(fix.TagNoQuoteSets, "1")
-    base.AddField(fix.TagSymbol, symbol)
-    // Use a 20-character placeholder to ensure enough space for any ReqID
-    base.AddField(fix.TagQuoteSetID, "____________________") 
+	entries := book.GetEntries()
 
-    entries := book.GetEntries()
-    base.AddField(fix.TagNoQuoteEntries, strconv.Itoa(len(entries)))
-    for _, entry := range entries {
-        base.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
-        base.AddField(fix.TagIssuer, entry.Issuer)
-        base.AddField(fix.TagBidSize, strconv.FormatFloat(entry.BidSize, 'f', 2, 64))
-        base.AddField(fix.TagOfferSize, strconv.FormatFloat(entry.OfferSize, 'f', 2, 64))
-        base.AddField(fix.TagBidSpotRate, strconv.FormatFloat(entry.BidSpotRate, 'f', 5, 64))
-        base.AddField(fix.TagOfferSpotRate, strconv.FormatFloat(entry.OfferSpotRate, 'f', 5, 64))
-    }
+	for _, sub := range subscribers {
+		msg := fix.NewMessage(fix.MsgTypeMassQuote)
+		msg.AddField(fix.TagQuoteID, sub.ClientReqID)
+		msg.AddField(fix.TagNoQuoteSets, "1")
+		// 296 group: 302, 295, then per-entry: 299, 188, 190, 134, 135
+		msg.AddField(fix.TagQuoteSetID, sub.ClientReqID)
+		msg.AddField(fix.TagNoQuoteEntries, strconv.Itoa(len(entries)))
+		for _, entry := range entries {
+			msg.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
+			msg.AddField(fix.TagBidSpotRate, strconv.FormatFloat(entry.BidSpotRate, 'f', 5, 64))
+			msg.AddField(fix.TagOfferSpotRate, strconv.FormatFloat(entry.OfferSpotRate, 'f', 5, 64))
+		}
 
-    tmpl := fix.NewTemplate(base, []int{fix.TagQuoteSetID})
-    
-    for _, sub := range subscribers {
-        metrics.FanoutTotal.WithLabelValues(symbol).Inc()
-        data := tmpl.Patch(fix.TagQuoteSetID, sub.ClientReqID)
-        
-        log.Trace().Str("symbol", symbol).Str("client", sub.Session.SenderCompID).Msg("Fanning out Mass Quote")
-        sub.Session.SendRaw(data)
-    }
+		metrics.FanoutTotal.WithLabelValues(symbol).Inc()
+		log.Trace().Str("symbol", symbol).Str("client", sub.Session.SenderCompID).Msg("Fanning out Mass Quote")
+		sub.Session.Send(msg)
+	}
 }
 
-// EmitSnapshot sends a Full Refresh (MsgType=W) to all subscribers.
-func EmitSnapshot(symbol string, book *QuoteBook, subscribers []ClientSub) {
-    if len(subscribers) == 0 {
-        return
-    }
+// EmitSnapshot sends a MarketDataSnapshot (35=W) full refresh to all subscribers.
+func (e *Engine) EmitSnapshot(symbol string, book *QuoteBook, subscribers []ClientSub) {
+	if len(subscribers) == 0 {
+		return
+	}
 
-    entries := book.GetEntries()
-    base := fix.NewMessage(fix.MsgTypeMarketDataSnapshot)
-    base.AddField(fix.TagSymbol, symbol)
-    // Placeholder for client MDReqID
-    base.AddField(fix.TagMDReqID, "____________________") 
-    base.AddField(fix.TagNoMDEntries, strconv.Itoa(len(entries)*2))
-    
-    for _, entry := range entries {
-        // Bid
-        base.AddField(fix.TagMDEntryType, "0")
-        base.AddField(fix.TagMDEntryPx, strconv.FormatFloat(entry.BidSpotRate, 'f', 5, 64))
-        base.AddField(fix.TagMDEntrySize, strconv.FormatFloat(entry.BidSize, 'f', 2, 64))
-        base.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
-        base.AddField(fix.TagIssuer, entry.Issuer)
-        
-        // Offer
-        base.AddField(fix.TagMDEntryType, "1")
-        base.AddField(fix.TagMDEntryPx, strconv.FormatFloat(entry.OfferSpotRate, 'f', 5, 64))
-        base.AddField(fix.TagMDEntrySize, strconv.FormatFloat(entry.OfferSize, 'f', 2, 64))
-        base.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
-        base.AddField(fix.TagIssuer, entry.Issuer)
-    }
+	entries := book.GetEntries()
 
-    tmpl := fix.NewTemplate(base, []int{fix.TagMDReqID})
-    
-    for _, sub := range subscribers {
-        data := tmpl.Patch(fix.TagMDReqID, sub.ClientReqID)
-        log.Trace().Str("symbol", symbol).Str("client", sub.Session.SenderCompID).Msg("Emitting Snapshot")
-        sub.Session.SendRaw(data)
-    }
+	for _, sub := range subscribers {
+		msg := fix.NewMessage(fix.MsgTypeMarketDataSnapshot)
+		msg.AddField(fix.TagSymbol, symbol)
+		msg.AddField(fix.TagMDReqID, sub.ClientReqID)
+		msg.AddField(fix.TagNoMDEntries, strconv.Itoa(len(entries)*2))
+		for _, entry := range entries {
+			msg.AddField(fix.TagMDEntryType, "0")
+			msg.AddField(fix.TagMDEntryPx, strconv.FormatFloat(entry.BidSpotRate, 'f', 5, 64))
+			msg.AddField(fix.TagMDEntrySize, strconv.FormatFloat(entry.BidSize, 'f', 2, 64))
+			msg.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
+			if entry.Issuer != "" {
+				msg.AddField(fix.TagIssuer, entry.Issuer)
+			}
+
+			msg.AddField(fix.TagMDEntryType, "1")
+			msg.AddField(fix.TagMDEntryPx, strconv.FormatFloat(entry.OfferSpotRate, 'f', 5, 64))
+			msg.AddField(fix.TagMDEntrySize, strconv.FormatFloat(entry.OfferSize, 'f', 2, 64))
+			msg.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
+			if entry.Issuer != "" {
+				msg.AddField(fix.TagIssuer, entry.Issuer)
+			}
+		}
+
+		log.Trace().Str("symbol", symbol).Str("client", sub.Session.SenderCompID).Msg("Emitting Snapshot")
+		sub.Session.Send(msg)
+	}
 }

@@ -121,8 +121,8 @@ func TestEndToEnd(t *testing.T) {
         t.Errorf("Expected MassQuote (i), got %s", msg.MsgType)
     }
     
-    sym, _ := msg.GetField(fix.TagSymbol)
-    if sym != "EUR/USD" {
-        t.Errorf("Expected EUR/USD, got %s", sym)
+    sym, _ := msg.GetField(fix.TagQuoteSetID)
+    if sym != "SUB01" {
+        t.Errorf("Expected SUB01 in QuoteSetID, got %s", sym)
     }
 }

@@ -26,24 +26,26 @@ type SymbolSubscription struct {
 }
 
 type Router struct {
-    symbols     sync.Map // string (symbol) -> *SymbolSubscription
-    reqIDToSym  sync.Map // string (upstreamReqID) -> string (symbol)
-    upstream   *session.UpstreamSession
+	symbols     sync.Map // string (symbol) -> *SymbolSubscription
+	reqIDToSym  sync.Map // string (upstreamReqID) -> string (symbol)
+	upstream   *session.UpstreamSession
 
-    books       sync.Map // string (symbol) -> *quote.QuoteBook
+	books       sync.Map // string (symbol) -> *quote.QuoteBook
+	engine      *quote.Engine
 
-    upstreamSeq int64
+	upstreamSeq int64
 
-    unsubDelay  time.Duration
-    pendingUnsub sync.Map // string (symbol) -> *time.Timer
+	unsubDelay  time.Duration
+	pendingUnsub sync.Map // string (symbol) -> *time.Timer
 }
 
 func NewRouter() *Router {
-    r := &Router{
-        unsubDelay: 5 * time.Second,
-    }
-    go r.snapshotLoop()
-    return r
+	r := &Router{
+		unsubDelay: 5 * time.Second,
+		engine:     quote.NewEngine(),
+	}
+	go r.snapshotLoop()
+	return r
 }
 
 func (r *Router) snapshotLoop() {
@@ -61,20 +63,20 @@ func (r *Router) snapshotLoop() {
 }
 
 func (r *Router) emitSnapshot(symbol string, book *quote.QuoteBook) {
-    if subVal, ok := r.symbols.Load(symbol); ok {
-        ss := subVal.(*SymbolSubscription)
-        ss.mu.RLock()
-        subscribers := make([]quote.ClientSub, 0, len(ss.Subscribers))
-        for _, cs := range ss.Subscribers {
-            subscribers = append(subscribers, quote.ClientSub{
-                Session:     cs.Session,
-                ClientReqID: cs.ClientReqID,
-            })
-        }
-        ss.mu.RUnlock()
+	if subVal, ok := r.symbols.Load(symbol); ok {
+		ss := subVal.(*SymbolSubscription)
+		ss.mu.RLock()
+		subscribers := make([]quote.ClientSub, 0, len(ss.Subscribers))
+		for _, cs := range ss.Subscribers {
+			subscribers = append(subscribers, quote.ClientSub{
+				Session:     cs.Session,
+				ClientReqID: cs.ClientReqID,
+			})
+		}
+		ss.mu.RUnlock()
 
-        quote.EmitSnapshot(symbol, book, subscribers)
-    }
+		r.engine.EmitSnapshot(symbol, book, subscribers)
+	}
 }
 
 func (r *Router) SetUpstream(u *session.UpstreamSession) {
@@ -138,36 +140,106 @@ func (r *Router) handleMassQuote(msg *fix.Message) {
 }
 
 func (r *Router) handleSnapshot(msg *fix.Message) {
-    // symbol, _ := msg.GetField(fix.TagSymbol)
-    // Process snapshot and replace quote book
-    // ... (implementation similar to mass quote)
+	symbol, ok := msg.GetField(fix.TagSymbol)
+	if !ok || symbol == "" {
+		return
+	}
+
+	entries := parseSnapshotEntries(msg.Fields)
+	if len(entries) == 0 {
+		return
+	}
+
+	val, _ := r.books.LoadOrStore(symbol, quote.NewQuoteBook(symbol))
+	book := val.(*quote.QuoteBook)
+	for _, entry := range entries {
+		book.Update(entry)
+	}
+	metrics.TicksTotal.WithLabelValues(symbol).Add(float64(len(entries)))
+
+	r.fanOutToSubscribers(symbol, book)
+}
+
+// parseSnapshotEntries extracts QuoteLevels from a MarketDataSnapshot (35=W) by
+// scanning fields linearly and pairing Bid (269=0) and Offer (269=1) by QuoteEntryID (299).
+func parseSnapshotEntries(fields []fix.Field) []quote.QuoteLevel {
+	levels := make(map[int]*quote.QuoteLevel)
+	currentType := ""
+	currentID := -1
+
+	for _, f := range fields {
+		switch f.Tag {
+		case fix.TagMDEntryType:
+			currentType = f.Value
+			currentID = -1
+		case fix.TagQuoteEntryID:
+			id, _ := strconv.Atoi(f.Value)
+			currentID = id
+			if _, ok := levels[id]; !ok {
+				levels[id] = &quote.QuoteLevel{QuoteEntryID: id}
+			}
+		case fix.TagMDEntryPx:
+			if currentID < 0 {
+				break
+			}
+			px, _ := strconv.ParseFloat(f.Value, 64)
+			if currentType == "0" {
+				levels[currentID].BidSpotRate = px
+			} else if currentType == "1" {
+				levels[currentID].OfferSpotRate = px
+			}
+		case fix.TagMDEntrySize:
+			if currentID < 0 {
+				break
+			}
+			sz, _ := strconv.ParseFloat(f.Value, 64)
+			if currentType == "0" {
+				levels[currentID].BidSize = sz
+			} else if currentType == "1" {
+				levels[currentID].OfferSize = sz
+			}
+		case fix.TagIssuer:
+			if currentID < 0 {
+				break
+			}
+			levels[currentID].Issuer = f.Value
+		}
+	}
+
+	result := make([]quote.QuoteLevel, 0, len(levels))
+	for _, lvl := range levels {
+		result = append(result, *lvl)
+	}
+	return result
 }
 
 func (r *Router) updateAndFanOut(symbol string, entry quote.QuoteLevel) {
-    val, ok := r.books.Load(symbol)
-    if !ok {
-        val, _ = r.books.LoadOrStore(symbol, quote.NewQuoteBook(symbol))
-    }
-    book := val.(*quote.QuoteBook)
-    book.Update(entry)
-    metrics.TicksTotal.WithLabelValues(symbol).Inc()
-    
-    // Get subscribers
-    if subVal, ok := r.symbols.Load(symbol); ok {
-        ss := subVal.(*SymbolSubscription)
-        ss.mu.RLock()
-        subscribers := make([]quote.ClientSub, 0, len(ss.Subscribers))
-        for _, cs := range ss.Subscribers {
-            subscribers = append(subscribers, quote.ClientSub{
-                Session:     cs.Session,
-                ClientReqID: cs.ClientReqID,
-            })
-        }
-        ss.mu.RUnlock()
-        
-        log.Debug().Str("symbol", symbol).Int("subscribers", len(subscribers)).Msg("Routing update to clients")
-        quote.FanOut(symbol, book, subscribers)
-    }
+	val, ok := r.books.Load(symbol)
+	if !ok {
+		val, _ = r.books.LoadOrStore(symbol, quote.NewQuoteBook(symbol))
+	}
+	book := val.(*quote.QuoteBook)
+	book.Update(entry)
+	metrics.TicksTotal.WithLabelValues(symbol).Inc()
+	r.fanOutToSubscribers(symbol, book)
+}
+
+func (r *Router) fanOutToSubscribers(symbol string, book *quote.QuoteBook) {
+	if subVal, ok := r.symbols.Load(symbol); ok {
+		ss := subVal.(*SymbolSubscription)
+		ss.mu.RLock()
+		subscribers := make([]quote.ClientSub, 0, len(ss.Subscribers))
+		for _, cs := range ss.Subscribers {
+			subscribers = append(subscribers, quote.ClientSub{
+				Session:     cs.Session,
+				ClientReqID: cs.ClientReqID,
+			})
+		}
+		ss.mu.RUnlock()
+
+		log.Debug().Str("symbol", symbol).Int("subscribers", len(subscribers)).Msg("Routing update to clients")
+		r.engine.FanOut(symbol, book, subscribers)
+	}
 }
 
 func (r *Router) OnClientSubscribe(s *session.ClientSession, msg *fix.Message) {

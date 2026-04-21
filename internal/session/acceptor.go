@@ -129,6 +129,7 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
     if s.heartBtInt == 0 {
         s.heartBtInt = 30
     }
+    resetSeqNum, _ := msg.GetField(fix.TagResetSeqNumFlag)
 
     s.logger = log.With().Str("client", s.SenderCompID).Str("id", s.ID).Logger()
     s.state = StateActive
@@ -150,6 +151,9 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
     ack.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
     ack.AddField(fix.TagEncryptMethod, "0")
     ack.AddField(fix.TagHeartBtInt, strconv.Itoa(s.heartBtInt))
+    if resetSeqNum == "Y" {
+        ack.AddField(fix.TagResetSeqNumFlag, "Y")
+    }
     s.Send(ack)
 
     go s.heartbeatLoop(sessionCtx)
@@ -180,8 +184,33 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *ClientSession) Send(msg *fix.Message) {
-    data := fix.Serialize(msg)
-    s.SendRaw(data)
+	// If the message was built without session header fields (e.g. MassQuote
+	// from the engine), inject them here so downstream clients receive a valid
+	// FIX message with 49/56/34/52.
+	hasSender := false
+	for _, f := range msg.Fields {
+		if f.Tag == fix.TagSenderCompID {
+			hasSender = true
+			break
+		}
+	}
+	if !hasSender {
+		seq := atomic.AddInt64(&s.outSeqNum, 1)
+		header := []fix.Field{
+			{Tag: fix.TagSenderCompID, Value: s.TargetCompID}, // acceptor CompID
+			{Tag: fix.TagTargetCompID, Value: s.SenderCompID}, // client CompID
+			{Tag: fix.TagMsgSeqNum, Value: strconv.FormatInt(seq, 10)},
+			{Tag: fix.TagSendingTime, Value: time.Now().UTC().Format("20060102-15:04:05.000")},
+		}
+		newFields := make([]fix.Field, 0, len(msg.Fields)+len(header))
+		newFields = append(newFields, msg.Fields[0]) // 35=MsgType
+		newFields = append(newFields, header...)
+		newFields = append(newFields, msg.Fields[1:]...)
+		msg.Fields = newFields
+	}
+
+	data := fix.Serialize(msg)
+	s.SendRaw(data)
 }
 
 func (s *ClientSession) SendRaw(data []byte) {
