@@ -145,36 +145,61 @@ func (s *UpstreamSession) connect() error {
 }
 
 func (s *UpstreamSession) Send(msg *fix.Message) error {
-    s.writeMu.Lock()
-    defer s.writeMu.Unlock()
-    
-    if s.conn == nil {
-        return fmt.Errorf("connection closed")
-    }
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-    data := fix.Serialize(msg)
+	if s.conn == nil {
+		return fmt.Errorf("connection closed")
+	}
 
-    // Increment and save outSeq
-    out := atomic.LoadInt64(&s.outSeqNum)
-    in := atomic.LoadInt64(&s.inSeqNum)
-    if err := s.store.Save(s.senderCompID, s.targetCompID, in, out); err != nil {
-        log.Error().Err(err).Msg("Failed to save sequence")
-    }
+	// If the message was built without session header fields (e.g. MarketDataRequest
+	// from the router), inject them here in the correct FIX field order:
+	// 35 (already first) → 49, 56, 34, 52 → rest of body.
+	hasSender := false
+	for _, f := range msg.Fields {
+		if f.Tag == fix.TagSenderCompID {
+			hasSender = true
+			break
+		}
+	}
+	if !hasSender {
+		seq := atomic.AddInt64(&s.outSeqNum, 1)
+		header := []fix.Field{
+			{Tag: fix.TagSenderCompID, Value: s.senderCompID},
+			{Tag: fix.TagTargetCompID, Value: s.targetCompID},
+			{Tag: fix.TagMsgSeqNum, Value: strconv.FormatInt(seq, 10)},
+			{Tag: fix.TagSendingTime, Value: time.Now().UTC().Format("20060102-15:04:05.000")},
+		}
+		// Fields[0] is always 35=MsgType; insert header right after it
+		newFields := make([]fix.Field, 0, len(msg.Fields)+len(header))
+		newFields = append(newFields, msg.Fields[0])
+		newFields = append(newFields, header...)
+		newFields = append(newFields, msg.Fields[1:]...)
+		msg.Fields = newFields
+	}
 
-    // Redact sensitive tags for logging
-    logStr := string(data)
-    if idx := bytes.Index(data, []byte("\x01554=")); idx != -1 {
-        // Found tag 554, find next SOH
-        start := idx + 5
-        end := bytes.IndexByte(data[start:], fix.SOH)
-        if end != -1 {
-            logStr = string(data[:start]) + "*****" + string(data[start+end:])
-        }
-    }
-    
-    log.Trace().Str("raw", logStr).Msg("Sending raw FIX message upstream")
-    _, err := s.conn.Write(data)
-    return err
+	data := fix.Serialize(msg)
+
+	// Save sequence state
+	out := atomic.LoadInt64(&s.outSeqNum)
+	in := atomic.LoadInt64(&s.inSeqNum)
+	if err := s.store.Save(s.senderCompID, s.targetCompID, in, out); err != nil {
+		log.Error().Err(err).Msg("Failed to save sequence")
+	}
+
+	// Redact password (tag 554) before logging
+	logStr := string(data)
+	if idx := bytes.Index(data, []byte("\x01554=")); idx != -1 {
+		start := idx + 5
+		end := bytes.IndexByte(data[start:], fix.SOH)
+		if end != -1 {
+			logStr = string(data[:start]) + "*****" + string(data[start+end:])
+		}
+	}
+
+	log.Trace().Str("raw", logStr).Msg("Sending raw FIX message upstream")
+	_, err := s.conn.Write(data)
+	return err
 }
 
 func (s *UpstreamSession) readLoop(ctx context.Context) {
@@ -195,11 +220,14 @@ func (s *UpstreamSession) readLoop(ctx context.Context) {
         }
 
         s.handleMessage(msg)
+        if s.state == StateClosed {
+            break
+        }
     }
 
     if err := scanner.Err(); err != nil {
         log.Error().Err(err).Msg("Upstream read error")
-    } else {
+    } else if s.state != StateClosed {
         log.Warn().Msg("Upstream connection closed by peer")
     }
     s.conn.Close()
@@ -248,7 +276,7 @@ func (s *UpstreamSession) handleMessage(msg *fix.Message) {
         log.Info().Msg("Upstream logout received")
         s.state = StateClosed
         metrics.UpstreamSessionState.Set(0)
-        s.conn.Close()
+        // Don't close conn here — readLoop will close it cleanly after this returns
     default:
         if s.onMsg != nil {
             s.onMsg(msg)

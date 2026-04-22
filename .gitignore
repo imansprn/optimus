@@ -28,3 +28,7 @@ config.toml
 # Go
 go/
 bin/
+data/*
+internal/integration/data/*
+docs/*
+.github/hooks/*
