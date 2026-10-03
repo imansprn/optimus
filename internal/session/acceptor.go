@@ -3,8 +3,9 @@ package session
 import (
     "bufio"
     "context"
-    "errors"
-    "net"
+	"errors"
+	"io"
+	"net"
     "github.com/imansprn/optimus/internal/fix"
     "github.com/imansprn/optimus/internal/metrics"
     "strconv"
@@ -103,6 +104,7 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
 
     scanner := bufio.NewScanner(conn)
     scanner.Split(fix.SplitFixMessage)
+    scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 
     // Read first message (Logon)
     if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
@@ -138,7 +140,7 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
     s.TargetCompID, _ = msg.GetField(fix.TagTargetCompID)
     hbt, _ := msg.GetField(fix.TagHeartBtInt)
     s.heartBtInt, _ = strconv.Atoi(hbt)
-    if s.heartBtInt == 0 {
+    if s.heartBtInt <= 0 {
         s.heartBtInt = 30
     }
     resetSeqNum, _ := msg.GetField(fix.TagResetSeqNumFlag)
@@ -173,12 +175,16 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
 
     go s.heartbeatLoop(sessionCtx)
 
-    // Main read loop
-    for scanner.Scan() {
+    // Main read loop. Set the deadline before blocking in Scan so a quiet client
+    // gets the full negotiated heartbeat interval after Logon.
+    for {
         if err := conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
             s.logger.Error().Err(err).Msg("Failed to set read deadline")
             s.cancel()
             return
+        }
+        if !scanner.Scan() {
+            break
         }
         data := scanner.Bytes()
         s.logger.Trace().Int("len", len(data)).Msg("Raw data received from client")
@@ -238,7 +244,7 @@ func (s *ClientSession) SendRaw(data []byte) {
         s.logger.Trace().Int("len", len(data)).Msg("Message queued for client")
     default:
         s.logger.Error().Int("queue_capacity", cap(s.outboundCh)).Msg("Outbound channel full; disconnecting slow client to avoid FIX sequence gaps")
-        metrics.SlowClientDrops.WithLabelValues(s.ID).Inc()
+		metrics.SlowClientDrops.Inc()
         s.cancel()
         _ = s.conn.Close()
     }
@@ -256,7 +262,7 @@ func (s *ClientSession) writeLoop(ctx context.Context) {
                 s.cancel()
                 return
             }
-            _, err := s.conn.Write(data)
+            err := writeFull(s.conn, data)
             if err != nil {
                 s.logger.Error().Err(err).Msg("Client write error")
                 s.cancel()
@@ -264,6 +270,22 @@ func (s *ClientSession) writeLoop(ctx context.Context) {
             }
         }
     }
+}
+
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func (s *ClientSession) heartbeatLoop(ctx context.Context) {

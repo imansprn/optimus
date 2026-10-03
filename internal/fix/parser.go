@@ -60,8 +60,8 @@ func Parse(data []byte) (*Message, error) {
         pos = sohPos + 1
     }
 
-    // Basic validation: must have 8, 9, 35, and 10.
-    if len(msg.Fields) < 4 {
+    // A valid message has the required envelope, message type, body length, and checksum.
+    if len(msg.Fields) < 4 || msg.MsgType == "" {
         return nil, ErrInvalidFormat
     }
     if msg.Fields[0].Tag != TagBeginString {
@@ -70,18 +70,33 @@ func Parse(data []byte) (*Message, error) {
     if msg.Fields[1].Tag != TagBodyLength {
         return nil, errors.New("missing or misplaced Tag 9")
     }
-
-    // Checksum validation
-    // Data to checksum is everything from start to the index of tag 10
-    idx10 := bytes.LastIndex(data, []byte("\x0110="))
-    if idx10 != -1 {
-        calculated := CalculateChecksum(data[:idx10+1])
-        provided, _ := msg.GetField(TagCheckSum)
-        if calculated != provided {
-            return nil, fmt.Errorf("checksum mismatch: expected %s, got %s", provided, calculated)
-        }
+    if msg.Fields[len(msg.Fields)-1].Tag != TagCheckSum {
+        return nil, errors.New("missing or misplaced Tag 10")
     }
 
+    bodyLengthText, _ := msg.GetField(TagBodyLength)
+    bodyLength, err := strconv.Atoi(bodyLengthText)
+    if err != nil || bodyLength < 0 {
+        return nil, ErrInvalidFormat
+    }
+    idx9 := bytes.Index(data, []byte("\x019="))
+    if idx9 < 0 {
+        return nil, ErrInvalidFormat
+    }
+    lengthStart := idx9 + 3
+    lengthEnd := bytes.IndexByte(data[lengthStart:], SOH)
+    if lengthEnd < 0 {
+        return nil, ErrInvalidFormat
+    }
+    bodyStart := lengthStart + lengthEnd + 1
+    idx10 := bytes.LastIndex(data, []byte("\x0110="))
+    if idx10 < 0 || idx10-bodyStart != bodyLength {
+        return nil, ErrInvalidFormat
+    }
+    provided, ok := msg.GetField(TagCheckSum)
+    if !ok || CalculateChecksum(data[:idx10+1]) != provided {
+        return nil, fmt.Errorf("%w: checksum mismatch", ErrChecksum)
+    }
     return msg, nil
 }
 

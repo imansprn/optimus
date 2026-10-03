@@ -84,11 +84,17 @@ func (s *UpstreamSession) reconnectLoop(ctx context.Context) {
             }
             delay := backoffs[idx]
             log.Info().Dur("delay", delay).Msg("Waiting to reconnect...")
-            time.Sleep(delay)
+            timer := time.NewTimer(delay)
+            select {
+            case <-ctx.Done():
+                timer.Stop()
+                return
+            case <-timer.C:
+            }
         }
 
         log.Info().Str("host", s.host).Int("port", s.port).Msg("Connecting to PrimeXM...")
-        err := s.connect()
+        err := s.connect(ctx)
         if err != nil {
             log.Error().Err(err).Msg("Failed to connect upstream")
             attempt++
@@ -102,13 +108,14 @@ func (s *UpstreamSession) reconnectLoop(ctx context.Context) {
     }
 }
 
-func (s *UpstreamSession) connect() error {
+func (s *UpstreamSession) connect(ctx context.Context) error {
     addr := fmt.Sprintf("%s:%d", s.host, s.port)
     dt := s.dialTimeout
     if dt <= 0 {
         dt = 10 * time.Second
     }
-    conn, err := net.DialTimeout("tcp", addr, dt)
+    dialer := net.Dialer{Timeout: dt}
+    conn, err := dialer.DialContext(ctx, "tcp", addr)
     if err != nil {
         return err
     }
@@ -147,7 +154,11 @@ func (s *UpstreamSession) connect() error {
     logon.AddField(fix.TagPassword, s.password)
 
     log.Debug().Msg("Logon request sent")
-    return s.Send(logon)
+    if err := s.Send(logon); err != nil {
+        _ = conn.Close()
+        return err
+    }
+    return nil
 }
 
 func (s *UpstreamSession) Send(msg *fix.Message) error {
@@ -204,18 +215,40 @@ func (s *UpstreamSession) Send(msg *fix.Message) error {
 	}
 
 	log.Trace().Str("raw", logStr).Msg("Sending raw FIX message upstream")
-	_, err := s.conn.Write(data)
-	return err
+	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	return writeFull(s.conn, data)
 }
 
 func (s *UpstreamSession) readLoop(ctx context.Context) {
-    scanner := bufio.NewScanner(s.conn)
+    conn := s.conn
+    stopClose := make(chan struct{})
+    go func() {
+        select {
+        case <-ctx.Done():
+            _ = conn.Close()
+        case <-stopClose:
+        }
+    }()
+    defer close(stopClose)
+    defer func() {
+        s.state = StateClosed
+        metrics.UpstreamSessionState.Set(0)
+        _ = conn.Close()
+    }()
+
+    scanner := bufio.NewScanner(conn)
     scanner.Split(fix.SplitFixMessage)
+    scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
     
-    for scanner.Scan() {
-        if err := s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
+    for {
+        if err := conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
             log.Error().Err(err).Msg("Failed to set read deadline")
             return
+        }
+        if !scanner.Scan() {
+            break
         }
         data := scanner.Bytes()
         
@@ -240,7 +273,19 @@ func (s *UpstreamSession) readLoop(ctx context.Context) {
 }
 
 func (s *UpstreamSession) handleMessage(msg *fix.Message) {
-    in := atomic.AddInt64(&s.inSeqNum, 1)
+    seqText, ok := msg.GetField(fix.TagMsgSeqNum)
+    seq, err := strconv.ParseInt(seqText, 10, 64)
+    if !ok || err != nil || seq < 1 {
+        log.Error().Str("msg_type", msg.MsgType).Msg("Upstream message has invalid MsgSeqNum")
+        s.state = StateClosed
+        return
+    }
+    previous := atomic.LoadInt64(&s.inSeqNum)
+    if seq != previous+1 {
+        log.Warn().Int64("expected", previous+1).Int64("received", seq).Msg("Upstream FIX sequence gap; automatic resend recovery is not implemented")
+    }
+    atomic.StoreInt64(&s.inSeqNum, seq)
+    in := seq
     out := atomic.LoadInt64(&s.outSeqNum)
     if err := s.store.Save(s.senderCompID, s.targetCompID, in, out); err != nil {
         log.Error().Err(err).Msg("Failed to save sequence")
@@ -254,6 +299,9 @@ func (s *UpstreamSession) handleMessage(msg *fix.Message) {
         s.state = StateActive
         metrics.UpstreamSessionState.Set(1)
         go s.heartbeatLoop()
+        if s.onMsg != nil {
+            s.onMsg(msg)
+        }
     case fix.MsgTypeHeartbeat:
         // Reset timeout handled by read deadline
     case fix.MsgTypeTestRequest:

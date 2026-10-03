@@ -26,6 +26,7 @@ type SymbolSubscription struct {
 }
 
 type Router struct {
+	subscriptionMu sync.Mutex // serializes subscription changes with grace-period callbacks
 	symbols     sync.Map // string (symbol) -> *SymbolSubscription
 	reqIDToSym  sync.Map // string (upstreamReqID) -> string (symbol)
 	upstream   *session.UpstreamSession
@@ -93,6 +94,8 @@ func (r *Router) OnClientDisconnect(s *session.ClientSession) {
 
 func (r *Router) OnUpstreamMessage(msg *fix.Message) {
     switch msg.MsgType {
+    case fix.MsgTypeLogon:
+        r.resubscribeAll()
     case fix.MsgTypeMassQuote:
         r.handleMassQuote(msg)
     case fix.MsgTypeMarketDataSnapshot:
@@ -102,123 +105,127 @@ func (r *Router) OnUpstreamMessage(msg *fix.Message) {
     }
 }
 
+func (r *Router) resubscribeAll() {
+	r.subscriptionMu.Lock()
+	defer r.subscriptionMu.Unlock()
+	r.symbols.Range(func(key, value interface{}) bool {
+        ss := value.(*SymbolSubscription)
+        ss.mu.Lock()
+        defer ss.mu.Unlock()
+        if len(ss.Subscribers) == 0 {
+            return true
+        }
+        if ss.UpstreamReqID != "" {
+            r.reqIDToSym.Delete(ss.UpstreamReqID)
+        }
+        r.sendUpstreamSubscribe(ss)
+        return true
+    })
+}
+
 func (r *Router) handleMassQuote(msg *fix.Message) {
-    // PrimeXM Mass Quote can have multiple QuoteSets
-    // Each 302 corresponds to an upstream MDReqID
-    
-    // For simplicity, we'll iterate and find 302
     var currentSymbol string
-    
-    // Note: Real parsing of repeating groups is complex. 
-    // This is a simplified version.
     for i := 0; i < len(msg.Fields); i++ {
         f := msg.Fields[i]
         if f.Tag == fix.TagQuoteSetID {
+            // A QuoteSetID starts a new group; never inherit the previous symbol.
+            currentSymbol = ""
             if sym, ok := r.reqIDToSym.Load(f.Value); ok {
                 currentSymbol = sym.(string)
             }
+            continue
         }
-        
-        if currentSymbol != "" && f.Tag == fix.TagQuoteEntryID {
-            // Start of a quote entry
-            entry := quote.QuoteLevel{}
-            entry.QuoteEntryID, _ = strconv.Atoi(f.Value)
-            
-            // Scan ahead for other fields in this entry
-            for j := i + 1; j < len(msg.Fields); j++ {
-                f2 := msg.Fields[j]
-                if f2.Tag == fix.TagQuoteEntryID || f2.Tag == fix.TagQuoteSetID {
-                    break
-                }
-                switch f2.Tag {
-                case fix.TagIssuer: entry.Issuer = f2.Value
-                case fix.TagBidSpotRate: entry.BidSpotRate, _ = strconv.ParseFloat(f2.Value, 64)
-                case fix.TagOfferSpotRate: entry.OfferSpotRate, _ = strconv.ParseFloat(f2.Value, 64)
-                case fix.TagBidSize: entry.BidSize, _ = strconv.ParseFloat(f2.Value, 64)
-                case fix.TagOfferSize: entry.OfferSize, _ = strconv.ParseFloat(f2.Value, 64)
-                }
+        if currentSymbol == "" || f.Tag != fix.TagQuoteEntryID {
+            continue
+        }
+        entry := quote.QuoteLevel{}
+        entry.QuoteEntryID, _ = strconv.Atoi(f.Value)
+        for j := i + 1; j < len(msg.Fields); j++ {
+            f2 := msg.Fields[j]
+            if f2.Tag == fix.TagQuoteEntryID || f2.Tag == fix.TagQuoteSetID {
+                break
             }
-            
-            r.updateAndFanOut(currentSymbol, entry)
+            switch f2.Tag {
+            case fix.TagIssuer:
+                entry.Issuer = f2.Value
+            case fix.TagBidSpotRate:
+                entry.BidSpotRate, _ = strconv.ParseFloat(f2.Value, 64)
+            case fix.TagOfferSpotRate:
+                entry.OfferSpotRate, _ = strconv.ParseFloat(f2.Value, 64)
+            case fix.TagBidSize:
+                entry.BidSize, _ = strconv.ParseFloat(f2.Value, 64)
+            case fix.TagOfferSize:
+                entry.OfferSize, _ = strconv.ParseFloat(f2.Value, 64)
+            }
         }
-    }
-    if currentSymbol == "" {
-        log.Trace().Msg("Mass Quote received but no matching subscribers found")
+        r.updateAndFanOut(currentSymbol, entry)
     }
 }
 
 func (r *Router) handleSnapshot(msg *fix.Message) {
-	symbol, ok := msg.GetField(fix.TagSymbol)
-	if !ok || symbol == "" {
-		return
-	}
-
-	entries := parseSnapshotEntries(msg.Fields)
-	if len(entries) == 0 {
-		return
-	}
-
-	val, _ := r.books.LoadOrStore(symbol, quote.NewQuoteBook(symbol))
-	book := val.(*quote.QuoteBook)
-	for _, entry := range entries {
-		book.Update(entry)
-	}
-	metrics.TicksTotal.WithLabelValues(symbol).Add(float64(len(entries)))
-
-	r.fanOutToSubscribers(symbol, book)
+    symbol, ok := msg.GetField(fix.TagSymbol)
+    if !ok || symbol == "" {
+        return
+    }
+    entries := parseSnapshotEntries(msg.Fields)
+    val, _ := r.books.LoadOrStore(symbol, quote.NewQuoteBook(symbol))
+    book := val.(*quote.QuoteBook)
+    book.Replace(entries)
+    metrics.TicksTotal.WithLabelValues(symbol).Add(float64(len(entries)))
+    r.fanOutToSubscribers(symbol, book)
 }
 
 // parseSnapshotEntries extracts QuoteLevels from a MarketDataSnapshot (35=W) by
 // scanning fields linearly and pairing Bid (269=0) and Offer (269=1) by QuoteEntryID (299).
 func parseSnapshotEntries(fields []fix.Field) []quote.QuoteLevel {
-	levels := make(map[int]*quote.QuoteLevel)
-	currentType := ""
-	currentID := -1
-
-	for _, f := range fields {
-		switch f.Tag {
-		case fix.TagMDEntryType:
-			currentType = f.Value
-			currentID = -1
-		case fix.TagQuoteEntryID:
-			id, _ := strconv.Atoi(f.Value)
-			currentID = id
-			if _, ok := levels[id]; !ok {
-				levels[id] = &quote.QuoteLevel{QuoteEntryID: id}
-			}
-		case fix.TagMDEntryPx:
-			if currentID < 0 {
-				break
-			}
-			px, _ := strconv.ParseFloat(f.Value, 64)
-			if currentType == "0" {
-				levels[currentID].BidSpotRate = px
-			} else if currentType == "1" {
-				levels[currentID].OfferSpotRate = px
-			}
-		case fix.TagMDEntrySize:
-			if currentID < 0 {
-				break
-			}
-			sz, _ := strconv.ParseFloat(f.Value, 64)
-			if currentType == "0" {
-				levels[currentID].BidSize = sz
-			} else if currentType == "1" {
-				levels[currentID].OfferSize = sz
-			}
-		case fix.TagIssuer:
-			if currentID < 0 {
-				break
-			}
-			levels[currentID].Issuer = f.Value
-		}
-	}
-
-	result := make([]quote.QuoteLevel, 0, len(levels))
-	for _, lvl := range levels {
-		result = append(result, *lvl)
-	}
-	return result
+    levels := make(map[int]*quote.QuoteLevel)
+    entryType := ""
+    entryID := -1
+    var price, size float64
+    var issuer string
+    flush := func() {
+        if entryID < 0 {
+            return
+        }
+        level := levels[entryID]
+        if level == nil {
+            level = &quote.QuoteLevel{QuoteEntryID: entryID}
+            levels[entryID] = level
+        }
+        if entryType == "0" {
+            level.BidSpotRate = price
+            level.BidSize = size
+        } else if entryType == "1" {
+            level.OfferSpotRate = price
+            level.OfferSize = size
+        }
+        if issuer != "" {
+            level.Issuer = issuer
+        }
+    }
+    for _, f := range fields {
+        switch f.Tag {
+        case fix.TagMDEntryType:
+            flush()
+            entryType = f.Value
+            entryID = -1
+            price, size, issuer = 0, 0, ""
+        case fix.TagMDEntryPx:
+            price, _ = strconv.ParseFloat(f.Value, 64)
+        case fix.TagMDEntrySize:
+            size, _ = strconv.ParseFloat(f.Value, 64)
+        case fix.TagQuoteEntryID:
+            entryID, _ = strconv.Atoi(f.Value)
+        case fix.TagIssuer:
+            issuer = f.Value
+        }
+    }
+    flush()
+    result := make([]quote.QuoteLevel, 0, len(levels))
+    for _, level := range levels {
+        result = append(result, *level)
+    }
+    return result
 }
 
 func (r *Router) updateAndFanOut(symbol string, entry quote.QuoteLevel) {
@@ -268,6 +275,8 @@ func (r *Router) OnClientSubscribe(s *session.ClientSession, msg *fix.Message) {
 }
 
 func (r *Router) subscribe(s *session.ClientSession, symbol, reqID string) {
+    r.subscriptionMu.Lock()
+    defer r.subscriptionMu.Unlock()
     val, loaded := r.symbols.LoadOrStore(symbol, &SymbolSubscription{
         Symbol:      symbol,
         Subscribers: make(map[string]ClientSubscription),
@@ -278,7 +287,8 @@ func (r *Router) subscribe(s *session.ClientSession, symbol, reqID string) {
     defer ss.mu.Unlock()
 
     firstSub := len(ss.Subscribers) == 0
-    ss.Subscribers[s.ID] = ClientSubscription{
+    subscriptionKey := s.ID + "\x00" + reqID
+    ss.Subscribers[subscriptionKey] = ClientSubscription{
         Session:     s,
         ClientReqID: reqID,
     }
@@ -287,11 +297,12 @@ func (r *Router) subscribe(s *session.ClientSession, symbol, reqID string) {
         // If there's a pending unsubscribe, cancel it
         if val, ok := r.pendingUnsub.Load(symbol); ok {
             timer := val.(*time.Timer)
-            if timer.Stop() {
-                log.Info().Str("symbol", symbol).Msg("Resuming previous symbol stream (unsubscription cancelled)")
-                r.pendingUnsub.Delete(symbol)
-                return
-            }
+            timer.Stop()
+            r.pendingUnsub.Delete(symbol)
+            log.Info().Str("symbol", symbol).Msg("Resuming previous symbol stream (unsubscription cancelled)")
+            // The global subscription lock prevents a fired callback from running
+            // before this cancellation is visible; the existing upstream request remains active.
+            return
         }
         r.sendUpstreamSubscribe(ss)
     }
@@ -300,6 +311,8 @@ func (r *Router) subscribe(s *session.ClientSession, symbol, reqID string) {
 }
 
 func (r *Router) unsubscribe(s *session.ClientSession, symbol, reqID string) {
+    r.subscriptionMu.Lock()
+    defer r.subscriptionMu.Unlock()
     val, ok := r.symbols.Load(symbol)
     if !ok {
         return
@@ -309,15 +322,43 @@ func (r *Router) unsubscribe(s *session.ClientSession, symbol, reqID string) {
     ss.mu.Lock()
     defer ss.mu.Unlock()
 
-    if _, subscribed := ss.Subscribers[s.ID]; !subscribed {
+    removed := false
+    if reqID != "" {
+        key := s.ID + "\x00" + reqID
+        if _, subscribed := ss.Subscribers[key]; subscribed {
+            delete(ss.Subscribers, key)
+            removed = true
+        }
+    } else {
+        for key, sub := range ss.Subscribers {
+            if sub.Session.ID == s.ID {
+                delete(ss.Subscribers, key)
+                removed = true
+            }
+        }
+    }
+    if !removed {
         return
     }
-    delete(ss.Subscribers, s.ID)
 
     if len(ss.Subscribers) == 0 {
         log.Info().Str("symbol", symbol).Dur("grace_period", r.unsubDelay).Msg("Last client unsubscribed. Starting unsubscription grace period...")
         
-        timer := time.AfterFunc(r.unsubDelay, func() {
+        var timer *time.Timer
+        timer = time.AfterFunc(r.unsubDelay, func() {
+            r.subscriptionMu.Lock()
+            defer r.subscriptionMu.Unlock()
+            pending, ok := r.pendingUnsub.Load(symbol)
+            current, exists := r.symbols.Load(symbol)
+            if !ok || pending != timer || !exists || current != ss {
+                return
+            }
+            ss.mu.Lock()
+            defer ss.mu.Unlock()
+            if len(ss.Subscribers) != 0 {
+                r.pendingUnsub.Delete(symbol)
+                return
+            }
             log.Info().Str("symbol", symbol).Msg("Unsubscription grace period expired. Sending upstream unsubscribe.")
             r.sendUpstreamUnsubscribe(ss)
             r.symbols.Delete(symbol)
@@ -354,8 +395,9 @@ func (r *Router) sendUpstreamUnsubscribe(ss *SymbolSubscription) {
         return
     }
 
+    reqID := ss.UpstreamReqID
     msg := fix.NewMessage(fix.MsgTypeMarketDataRequest)
-    msg.AddField(fix.TagMDReqID, ss.UpstreamReqID)
+    msg.AddField(fix.TagMDReqID, reqID)
     msg.AddField(fix.TagSubscriptionRequestType, "2") // Unsubscribe
     msg.AddField(fix.TagNoRelatedSym, "1")
     msg.AddField(fix.TagSymbol, ss.Symbol)
@@ -364,16 +406,11 @@ func (r *Router) sendUpstreamUnsubscribe(ss *SymbolSubscription) {
     if err := r.upstream.Send(msg); err != nil {
         log.Error().Err(err).Msg("Failed to send upstream unsubscription")
     }
+    r.reqIDToSym.Delete(reqID)
     ss.UpstreamReqID = ""
 }
 
 // encodeID encodes a sequence number into a 3-character string (Base36).
 func encodeID(seq int64) string {
-    const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    res := make([]byte, 3)
-    for i := 2; i >= 0; i-- {
-        res[i] = chars[seq%36]
-        seq /= 36
-    }
-    return string(res)
+    return strconv.FormatInt(seq, 36)
 }

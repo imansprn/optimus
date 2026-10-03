@@ -26,8 +26,8 @@ var (
         Help: "Total number of market data messages fanned out to clients",
     }, []string{"symbol"})
 
-    SlowClientDrops = promauto.NewCounterVec(prometheus.CounterOpts{
-        Name: "fix_gateway_slow_client_drops_total",
-        Help: "Total number of queue overflows that triggered slow client disconnects",
-    }, []string{"client_id"})
+	SlowClientDrops = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "fix_gateway_slow_client_drops_total",
+		Help: "Total number of queue overflows that triggered slow client disconnects",
+	})
 )
