@@ -83,6 +83,14 @@ func (r *Router) SetUpstream(u *session.UpstreamSession) {
     r.upstream = u
 }
 
+// OnClientDisconnect removes every subscription owned by a closed FIX session.
+func (r *Router) OnClientDisconnect(s *session.ClientSession) {
+    r.symbols.Range(func(key, _ interface{}) bool {
+        r.unsubscribe(s, key.(string), "")
+        return true
+    })
+}
+
 func (r *Router) OnUpstreamMessage(msg *fix.Message) {
     switch msg.MsgType {
     case fix.MsgTypeMassQuote:
@@ -301,6 +309,9 @@ func (r *Router) unsubscribe(s *session.ClientSession, symbol, reqID string) {
     ss.mu.Lock()
     defer ss.mu.Unlock()
 
+    if _, subscribed := ss.Subscribers[s.ID]; !subscribed {
+        return
+    }
     delete(ss.Subscribers, s.ID)
 
     if len(ss.Subscribers) == 0 {

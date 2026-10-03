@@ -14,6 +14,8 @@ type Config struct {
     UpstreamTarget  string `mapstructure:"upstream_target"`
     UpstreamUser    string `mapstructure:"upstream_user"`
     UpstreamPass    string `mapstructure:"upstream_pass"`
+    // UpstreamDialTimeoutSec is the TCP connect timeout (seconds) to the upstream venue.
+    UpstreamDialTimeoutSec int `mapstructure:"upstream_dial_timeout_seconds"`
 
     ListenAddr      string `mapstructure:"listen_addr"`
     AcceptorSender  string `mapstructure:"acceptor_sender"`
@@ -30,8 +32,9 @@ func Load() *Config {
     v.SetDefault("upstream_port", 9879)
     v.SetDefault("upstream_sender", "GW01")
     v.SetDefault("upstream_target", "PXMD")
+    v.SetDefault("upstream_dial_timeout_seconds", 10)
     v.SetDefault("listen_addr", "0.0.0.0:9878")
-    v.SetDefault("acceptor_sender", "GW_GATEWAY")
+    v.SetDefault("acceptor_sender", "PXMD")
     v.SetDefault("log_level", "info")
     v.SetDefault("log_format", "console")
 

@@ -54,7 +54,7 @@ func TestEndToEnd(t *testing.T) {
 
     // 2. Start Gateway
     r := router.NewRouter()
-    upstream := session.NewUpstreamSession("127.0.0.1", 9999, "GW01", "PXMD", "user", "pass", 30, r.OnUpstreamMessage)
+    upstream := session.NewUpstreamSession("127.0.0.1", 9999, "GW01", "PXMD", "user", "pass", 30, 2*time.Second, r.OnUpstreamMessage)
     r.SetUpstream(upstream)
     
     acceptor := session.NewAcceptor(gwAddr, "GW_GATEWAY", nil, r.OnClientSubscribe)

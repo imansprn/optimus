@@ -6,7 +6,10 @@ data:
   config.yaml: |
     upstream_host: "pricing.primexm.com"
     upstream_port: 9879
+    upstream_sender: "GW01"
+    upstream_target: "PXMD"
     listen_addr: "0.0.0.0:9878"
+    acceptor_sender: "PXMD"
     log_level: "info"
 ---
 apiVersion: apps/v1

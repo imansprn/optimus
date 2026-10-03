@@ -3,6 +3,7 @@ package session
 import (
     "bufio"
     "context"
+    "errors"
     "net"
     "github.com/imansprn/optimus/internal/fix"
     "github.com/imansprn/optimus/internal/metrics"
@@ -20,6 +21,7 @@ type ClientSession struct {
     ID            string
     SenderCompID  string
     TargetCompID  string
+    AcceptorCompID string
     conn          net.Conn
     outboundCh    chan []byte
     outSeqNum     int64
@@ -28,6 +30,9 @@ type ClientSession struct {
     state         SessionState
     cancel        context.CancelFunc
     logger        zerolog.Logger
+    // closingAfterLogout is set before cancel when the client sends Logout, so the
+    // subsequent read error from closing the socket is not logged as a failure.
+    closingAfterLogout atomic.Bool
 }
 
 type Acceptor struct {
@@ -36,6 +41,12 @@ type Acceptor struct {
     sessions      sync.Map // string -> *ClientSession
     onMarketData  func(*ClientSession, *fix.Message)
     onSubscribe   func(*ClientSession, *fix.Message)
+    onDisconnect  func(*ClientSession)
+}
+
+// SetOnDisconnect registers cleanup for subscriptions owned by a client session.
+func (a *Acceptor) SetOnDisconnect(fn func(*ClientSession)) {
+    a.onDisconnect = fn
 }
 
 func NewAcceptor(addr, sender string, onMD, onSub func(*ClientSession, *fix.Message)) *Acceptor {
@@ -85,6 +96,7 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
         state:        StateConnecting,
         cancel:       cancel,
         logger:       log.With().Str("session_id", "").Logger(), // Will update after logon
+        AcceptorCompID: a.senderCompID,
     }
 
     go s.writeLoop(sessionCtx)
@@ -137,6 +149,9 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
     metrics.DownstreamSessions.Inc()
 
     defer func() {
+        if a.onDisconnect != nil {
+            a.onDisconnect(s)
+        }
         a.sessions.Delete(s.ID)
         metrics.DownstreamSessions.Dec()
     }()
@@ -179,7 +194,11 @@ func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
     }
 
     if err := scanner.Err(); err != nil {
-        s.logger.Error().Err(err).Msg("Client read error")
+        if s.closingAfterLogout.Load() && errors.Is(err, net.ErrClosed) {
+            s.logger.Debug().Msg("Client read closed after logout")
+        } else {
+            s.logger.Error().Err(err).Msg("Client read error")
+        }
     }
 }
 
@@ -197,7 +216,7 @@ func (s *ClientSession) Send(msg *fix.Message) {
 	if !hasSender {
 		seq := atomic.AddInt64(&s.outSeqNum, 1)
 		header := []fix.Field{
-			{Tag: fix.TagSenderCompID, Value: s.TargetCompID}, // acceptor CompID
+			{Tag: fix.TagSenderCompID, Value: s.AcceptorCompID},
 			{Tag: fix.TagTargetCompID, Value: s.SenderCompID}, // client CompID
 			{Tag: fix.TagMsgSeqNum, Value: strconv.FormatInt(seq, 10)},
 			{Tag: fix.TagSendingTime, Value: time.Now().UTC().Format("20060102-15:04:05.000")},
@@ -218,8 +237,10 @@ func (s *ClientSession) SendRaw(data []byte) {
     case s.outboundCh <- data:
         s.logger.Trace().Int("len", len(data)).Msg("Message queued for client")
     default:
-        s.logger.Warn().Msg("Outbound channel full, dropping message")
+        s.logger.Error().Int("queue_capacity", cap(s.outboundCh)).Msg("Outbound channel full; disconnecting slow client to avoid FIX sequence gaps")
         metrics.SlowClientDrops.WithLabelValues(s.ID).Inc()
+        s.cancel()
+        _ = s.conn.Close()
     }
 }
 
@@ -255,7 +276,7 @@ func (s *ClientSession) heartbeatLoop(ctx context.Context) {
             return
         case <-ticker.C:
             hb := fix.NewMessage(fix.MsgTypeHeartbeat)
-            hb.AddField(fix.TagSenderCompID, s.TargetCompID)
+            hb.AddField(fix.TagSenderCompID, s.AcceptorCompID)
             hb.AddField(fix.TagTargetCompID, s.SenderCompID)
             hb.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&s.outSeqNum, 1), 10))
             hb.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
@@ -279,6 +300,7 @@ func (a *Acceptor) handleClientMessage(s *ClientSession, msg *fix.Message) {
         }
     case fix.MsgTypeLogout:
         s.logger.Info().Msg("Client logout")
+        s.closingAfterLogout.Store(true)
         s.cancel()
     default:
         s.logger.Debug().Str("type", msg.MsgType).Msg("Unhandled client message")

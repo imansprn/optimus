@@ -20,6 +20,7 @@ type UpstreamSession struct {
     conn         net.Conn
     host         string
     port         int
+    dialTimeout  time.Duration
     senderCompID string
     targetCompID string
     username     string
@@ -44,10 +45,11 @@ const (
     StateClosed
 )
 
-func NewUpstreamSession(host string, port int, sender, target, user, pass string, heartBt int, onMsg func(*fix.Message)) *UpstreamSession {
+func NewUpstreamSession(host string, port int, sender, target, user, pass string, heartBt int, dialTimeout time.Duration, onMsg func(*fix.Message)) *UpstreamSession {
     return &UpstreamSession{
         host:         host,
         port:         port,
+        dialTimeout:  dialTimeout,
         senderCompID: sender,
         targetCompID: target,
         username:     user,
@@ -102,7 +104,11 @@ func (s *UpstreamSession) reconnectLoop(ctx context.Context) {
 
 func (s *UpstreamSession) connect() error {
     addr := fmt.Sprintf("%s:%d", s.host, s.port)
-    conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+    dt := s.dialTimeout
+    if dt <= 0 {
+        dt = 10 * time.Second
+    }
+    conn, err := net.DialTimeout("tcp", addr, dt)
     if err != nil {
         return err
     }

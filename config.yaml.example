@@ -1,16 +1,30 @@
 # optimus Configuration Example
 
-# Upstream PrimeXM pricing session settings
+# PrimeXM typically allows only ONE FIX session per account. optimus holds that session
+# upstream and multiplexes many downstream clients (each opens a FIX session to optimus).
+
+# Upstream PrimeXM pricing session settings (the single venue connection)
 upstream_host: "pricing.primexm.com"
 upstream_port: 9879
-upstream_sender: "GW01"     # Provided by PrimeXM (Tag 49)
-upstream_target: "PXMD"     # Provided by PrimeXM (Tag 56)
+upstream_sender: "GW01"     # Provided by PrimeXM — optimus Tag 49 toward PrimeXM
+upstream_target: "PXMD"     # Provided by PrimeXM — optimus Tag 56 toward PrimeXM
 upstream_user: "your_user"  # Provided by PrimeXM (Tag 553)
 upstream_pass: "your_pass"  # Provided by PrimeXM (Tag 554)
+# TCP connect timeout to upstream (seconds). If dials fail with i/o timeout, confirm VPN /
+# IP allowlisting with the venue and consider increasing this only after the path is reachable
+# (e.g. `nc -vz <upstream_host> <upstream_port>` from the deployment network).
+upstream_dial_timeout_seconds: 10
 
-# Gateway listener settings
+# Downstream: TCP acceptor for FIX clients (plain TCP; no TLS in the gateway by default)
 listen_addr: "0.0.0.0:9878"
-acceptor_sender: "GW_GATEWAY" # Your ID presented to downstream clients
+
+# Tag 49 (SenderCompID) on logon ack and heartbeats from optimus toward downstream clients.
+# Set this to the SAME venue / counterparty CompID your clients use as TargetCompID (Tag 56)
+# when they used to connect directly to PrimeXM — e.g. the id PrimeXM puts in Tag 49 on
+# messages to the client. For clients with standard config naming (sender = Tag 49, target = Tag 56),
+# this matches their "target" / venue id (e.g. stream.targetCompId in fix_streaming).
+# If you use a new id here (e.g. GW_GATEWAY), every downstream must change their TargetCompID.
+acceptor_sender: "PXMD"
 
 # Logging settings
 log_level: "info"             # debug, info, warn, error, fatal, panic, trace

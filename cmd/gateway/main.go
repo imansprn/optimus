@@ -11,6 +11,7 @@ import (
 
     "github.com/prometheus/client_golang/prometheus/promhttp"
     "net/http"
+    "time"
 
     "github.com/rs/zerolog/log"
 )
@@ -28,6 +29,8 @@ func main() {
     r := router.NewRouter()
 
     // 2. Create Upstream Initiator
+    dialTimeout := time.Duration(cfg.UpstreamDialTimeoutSec) * time.Second
+
     upstream := session.NewUpstreamSession(
         cfg.UpstreamHost,
         cfg.UpstreamPort,
@@ -36,6 +39,7 @@ func main() {
         cfg.UpstreamUser,
         cfg.UpstreamPass,
         30, // HeartBtInt
+        dialTimeout,
         r.OnUpstreamMessage,
     )
 
@@ -49,6 +53,7 @@ func main() {
         nil, // onMarketData (unused for now)
         r.OnClientSubscribe,
     )
+    acceptor.SetOnDisconnect(r.OnClientDisconnect)
 
     // 4. Start services
     upstream.Start(ctx)

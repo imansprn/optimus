@@ -28,6 +28,6 @@ var (
 
     SlowClientDrops = promauto.NewCounterVec(prometheus.CounterOpts{
         Name: "fix_gateway_slow_client_drops_total",
-        Help: "Total number of messages dropped due to slow client buffers",
+        Help: "Total number of queue overflows that triggered slow client disconnects",
     }, []string{"client_id"})
 )
