@@ -40,6 +40,8 @@ func (e *Engine) FanOut(symbol string, book *QuoteBook, subscribers []ClientSub)
 			msg.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
 			msg.AddField(fix.TagBidSpotRate, strconv.FormatFloat(entry.BidSpotRate, 'f', 5, 64))
 			msg.AddField(fix.TagOfferSpotRate, strconv.FormatFloat(entry.OfferSpotRate, 'f', 5, 64))
+			msg.AddField(fix.TagBidSize, strconv.FormatFloat(entry.BidSize, 'f', 2, 64))
+			msg.AddField(fix.TagOfferSize, strconv.FormatFloat(entry.OfferSize, 'f', 2, 64))
 		}
 
 		metrics.FanoutTotal.WithLabelValues(symbol).Inc()
