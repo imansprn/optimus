@@ -130,16 +130,11 @@ func (s *UpstreamSession) connect(ctx context.Context) error {
     s.state = StateConnecting
     log.Info().Str("host", s.host).Int("port", s.port).Msg("Connected to PrimeXM. Sending Logon...")
     
-    // Load sequences from store
-    in, out, err := s.store.Load(s.senderCompID, s.targetCompID)
-    if err == nil && in > 0 {
-        atomic.StoreInt64(&s.inSeqNum, in)
-        atomic.StoreInt64(&s.outSeqNum, out)
-        log.Info().Int64("in", in).Int64("out", out).Msg("Restored session sequences")
-    } else {
-        // New session or reset
-        atomic.StoreInt64(&s.inSeqNum, 0)
-        atomic.StoreInt64(&s.outSeqNum, 0)
+    // PrimeXM pricing sessions reset sequence numbers on every logon.
+    atomic.StoreInt64(&s.inSeqNum, 0)
+    atomic.StoreInt64(&s.outSeqNum, 0)
+    if err := s.store.Save(s.senderCompID, s.targetCompID, 0, 0); err != nil {
+        log.Error().Err(err).Msg("Failed to reset pricing session sequences")
     }
     clear(s.pendingMessages)
     s.resendUntil = 0
@@ -153,11 +148,7 @@ func (s *UpstreamSession) connect(ctx context.Context) error {
     logon.AddField(fix.TagEncryptMethod, "0")
     logon.AddField(fix.TagHeartBtInt, strconv.Itoa(s.heartBtInt))
     
-    if in == 0 {
-        logon.AddField(fix.TagResetSeqNumFlag, "Y")
-    } else {
-        logon.AddField(fix.TagResetSeqNumFlag, "N")
-    }
+    logon.AddField(fix.TagResetSeqNumFlag, "Y")
     
     logon.AddField(fix.TagUsername, s.username)
     logon.AddField(fix.TagPassword, s.password)
