@@ -90,7 +90,7 @@ func Parse(data []byte) (*Message, error) {
     }
     bodyStart := lengthStart + lengthEnd + 1
     idx10 := bytes.LastIndex(data, []byte("\x0110="))
-    if idx10 < 0 || idx10-bodyStart != bodyLength {
+    if idx10 < 0 || idx10-bodyStart+1 != bodyLength {
         return nil, ErrInvalidFormat
     }
     provided, ok := msg.GetField(TagCheckSum)
