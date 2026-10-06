@@ -48,7 +48,7 @@ pipeline {
                     TARGET="${DEPLOY_USER}@${DEPLOY_HOST_DEV}"
 
                     scp $SSH_OPTS bin/gateway ${TARGET}:${APP_DIR}/gateway.new
-                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} bash -s" < deploy/remote-deploy.sh
+                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} COMMIT_ID=${GITHUB_COMMIT_ID} bash -s" < deploy/remote-deploy.sh
                 '''
             }
         }
@@ -62,7 +62,7 @@ pipeline {
                     TARGET="${DEPLOY_USER}@${DEPLOY_HOST_PROD}"
 
                     scp $SSH_OPTS bin/gateway ${TARGET}:${APP_DIR}/gateway.new
-                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} bash -s" < deploy/remote-deploy.sh
+                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} COMMIT_ID=${GITHUB_COMMIT_ID} bash -s" < deploy/remote-deploy.sh
                 '''
             }
         }
