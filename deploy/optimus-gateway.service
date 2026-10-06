@@ -1,0 +1,40 @@
+[Unit]
+Description=Optimus Gateway (PrimeXM FIX Gateway)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=halim
+Group=halim
+WorkingDirectory=/home/halim/optimus
+ExecStart=/home/halim/optimus/gateway
+
+# Restart & shutdown
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Resource limits (banyak koneksi FIX)
+LimitNOFILE=65536
+
+# Logging ke journald (app menulis ke stdout/stderr)
+SyslogIdentifier=optimus-gateway
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/halim/optimus
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

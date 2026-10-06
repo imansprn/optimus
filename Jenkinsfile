@@ -4,7 +4,7 @@ pipeline {
     environment {
         OVERRIDE_SERVICE_NAME   = 'optimus-gateway'
         DEPLOY_HOST_DEV         = "${OPTIMUS_HOST_DEV}"
-        DEPLOY_HOST_PROD        = "${$OPTIMUS_HOST_PROD}"
+        DEPLOY_HOST_PROD        = "${OPTIMUS_HOST_PROD}"
         DEPLOY_USER             = 'halim'
         APP_DIR                 = '/home/halim/optimus'
         GITHUB_COMMIT_ID        = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
@@ -50,7 +50,7 @@ pipeline {
                     TARGET="${DEPLOY_USER}@${DEPLOY_HOST_DEV}"
 
                     scp $SSH_OPTS bin/gateway ${TARGET}:${APP_DIR}/gateway.new
-                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} bash -s" < deploy/remote-deploy.sh
+                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} COMMIT_ID=${GITHUB_COMMIT_ID} bash -s" < deploy/remote-deploy.sh
                 '''
             }
         }
@@ -66,7 +66,7 @@ pipeline {
                     TARGET="${DEPLOY_USER}@${DEPLOY_HOST_PROD}"
 
                     scp $SSH_OPTS bin/gateway ${TARGET}:${APP_DIR}/gateway.new
-                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} bash -s" < deploy/remote-deploy.sh
+                    ssh $SSH_OPTS ${TARGET} "APP_DIR=${APP_DIR} SERVICE=${OVERRIDE_SERVICE_NAME} COMMIT_ID=${GITHUB_COMMIT_ID} bash -s" < deploy/remote-deploy.sh
                 '''
             }
         }
