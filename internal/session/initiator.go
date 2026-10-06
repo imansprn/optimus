@@ -20,6 +20,7 @@ type UpstreamSession struct {
     conn         net.Conn
     host         string
     port         int
+    dialTimeout  time.Duration
     senderCompID string
     targetCompID string
     username     string
@@ -27,6 +28,8 @@ type UpstreamSession struct {
     heartBtInt   int
     inSeqNum     int64
     outSeqNum    int64
+    pendingMessages map[int64]*fix.Message
+    resendUntil int64
     state        SessionState
     reconnectCh  chan struct{}
     writeMu      sync.Mutex
@@ -44,16 +47,22 @@ const (
     StateClosed
 )
 
-func NewUpstreamSession(host string, port int, sender, target, user, pass string, heartBt int, onMsg func(*fix.Message)) *UpstreamSession {
+func NewUpstreamSession(host string, port int, sender, target, user, pass string, heartBt int, dialTimeout time.Duration, onMsg func(*fix.Message)) *UpstreamSession {
+	if heartBt <= 0 {
+		log.Warn().Int("heart_bt_int", heartBt).Msg("Invalid upstream heartbeat interval; defaulting to 30 seconds")
+		heartBt = 30
+	}
     return &UpstreamSession{
         host:         host,
         port:         port,
+        dialTimeout:  dialTimeout,
         senderCompID: sender,
         targetCompID: target,
         username:     user,
         password:     pass,
         heartBtInt:   heartBt,
         reconnectCh:  make(chan struct{}, 1),
+        pendingMessages: make(map[int64]*fix.Message),
         onMsg:        onMsg,
         store:        NewSequenceStore("./data"),
     }
@@ -82,11 +91,17 @@ func (s *UpstreamSession) reconnectLoop(ctx context.Context) {
             }
             delay := backoffs[idx]
             log.Info().Dur("delay", delay).Msg("Waiting to reconnect...")
-            time.Sleep(delay)
+            timer := time.NewTimer(delay)
+            select {
+            case <-ctx.Done():
+                timer.Stop()
+                return
+            case <-timer.C:
+            }
         }
 
         log.Info().Str("host", s.host).Int("port", s.port).Msg("Connecting to PrimeXM...")
-        err := s.connect()
+        err := s.connect(ctx)
         if err != nil {
             log.Error().Err(err).Msg("Failed to connect upstream")
             attempt++
@@ -100,9 +115,14 @@ func (s *UpstreamSession) reconnectLoop(ctx context.Context) {
     }
 }
 
-func (s *UpstreamSession) connect() error {
+func (s *UpstreamSession) connect(ctx context.Context) error {
     addr := fmt.Sprintf("%s:%d", s.host, s.port)
-    conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+    dt := s.dialTimeout
+    if dt <= 0 {
+        dt = 10 * time.Second
+    }
+    dialer := net.Dialer{Timeout: dt}
+    conn, err := dialer.DialContext(ctx, "tcp", addr)
     if err != nil {
         return err
     }
@@ -121,6 +141,8 @@ func (s *UpstreamSession) connect() error {
         atomic.StoreInt64(&s.inSeqNum, 0)
         atomic.StoreInt64(&s.outSeqNum, 0)
     }
+    clear(s.pendingMessages)
+    s.resendUntil = 0
 
     logon := fix.NewMessage(fix.MsgTypeLogon)
     // ... (rest of message setup)
@@ -141,7 +163,11 @@ func (s *UpstreamSession) connect() error {
     logon.AddField(fix.TagPassword, s.password)
 
     log.Debug().Msg("Logon request sent")
-    return s.Send(logon)
+    if err := s.Send(logon); err != nil {
+        _ = conn.Close()
+        return err
+    }
+    return nil
 }
 
 func (s *UpstreamSession) Send(msg *fix.Message) error {
@@ -198,18 +224,44 @@ func (s *UpstreamSession) Send(msg *fix.Message) error {
 	}
 
 	log.Trace().Str("raw", logStr).Msg("Sending raw FIX message upstream")
-	_, err := s.conn.Write(data)
-	return err
+	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	return writeFull(s.conn, data)
 }
 
+const maxPendingUpstreamMessages = 16
+
 func (s *UpstreamSession) readLoop(ctx context.Context) {
-    scanner := bufio.NewScanner(s.conn)
+    conn := s.conn
+    connCtx, cancelConn := context.WithCancel(ctx)
+    defer cancelConn()
+    stopClose := make(chan struct{})
+    go func() {
+        select {
+        case <-ctx.Done():
+            _ = conn.Close()
+        case <-stopClose:
+        }
+    }()
+    defer close(stopClose)
+    defer func() {
+        s.state = StateClosed
+        metrics.UpstreamSessionState.Set(0)
+        _ = conn.Close()
+    }()
+
+    scanner := bufio.NewScanner(conn)
     scanner.Split(fix.SplitFixMessage)
+    scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
     
-    for scanner.Scan() {
-        if err := s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
+    for {
+        if err := conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
             log.Error().Err(err).Msg("Failed to set read deadline")
             return
+        }
+        if !scanner.Scan() {
+            break
         }
         data := scanner.Bytes()
         
@@ -219,7 +271,7 @@ func (s *UpstreamSession) readLoop(ctx context.Context) {
             continue
         }
 
-        s.handleMessage(msg)
+        s.handleMessage(connCtx, msg)
         if s.state == StateClosed {
             break
         }
@@ -233,8 +285,76 @@ func (s *UpstreamSession) readLoop(ctx context.Context) {
     s.conn.Close()
 }
 
-func (s *UpstreamSession) handleMessage(msg *fix.Message) {
-    in := atomic.AddInt64(&s.inSeqNum, 1)
+func (s *UpstreamSession) handleMessage(ctx context.Context, msg *fix.Message) {
+    seqText, ok := msg.GetField(fix.TagMsgSeqNum)
+    seq, err := strconv.ParseInt(seqText, 10, 64)
+    if !ok || err != nil || seq < 1 {
+        log.Error().Str("msg_type", msg.MsgType).Msg("Upstream message has invalid MsgSeqNum")
+        s.state = StateClosed
+        return
+    }
+    previous := atomic.LoadInt64(&s.inSeqNum)
+    expected := previous + 1
+    if seq < expected {
+        log.Warn().Int64("expected", expected).Int64("received", seq).Msg("Ignoring duplicate or stale upstream FIX message")
+        return
+    }
+    if seq > expected {
+        if s.pendingMessages == nil {
+            s.pendingMessages = make(map[int64]*fix.Message)
+        }
+        if _, exists := s.pendingMessages[seq]; !exists && len(s.pendingMessages) >= maxPendingUpstreamMessages {
+            log.Error().Int("pending_messages", len(s.pendingMessages)).Msg("Too many out-of-order upstream FIX messages; closing session")
+            s.state = StateClosed
+            if s.conn != nil { _ = s.conn.Close() }
+            return
+        }
+        s.pendingMessages[seq] = msg
+        if seq-1 > s.resendUntil {
+            request := fix.NewMessage(fix.MsgTypeResendRequest)
+            request.AddField(fix.TagBeginSeqNo, strconv.FormatInt(expected, 10))
+            request.AddField(fix.TagEndSeqNo, strconv.FormatInt(seq-1, 10))
+            if err := s.Send(request); err != nil {
+                log.Error().Err(err).Msg("Failed to request upstream FIX resend")
+                s.state = StateClosed
+                if s.conn != nil { _ = s.conn.Close() }
+                return
+            }
+            s.resendUntil = seq - 1
+            log.Warn().Int64("begin_seq_no", expected).Int64("end_seq_no", seq-1).Msg("Requested missing upstream FIX messages")
+        }
+        return
+    }
+    s.processOrderedMessage(ctx, msg, seq)
+    for {
+        next := atomic.LoadInt64(&s.inSeqNum) + 1
+        pending, ok := s.pendingMessages[next]
+        if !ok { break }
+        delete(s.pendingMessages, next)
+        s.processOrderedMessage(ctx, pending, next)
+        if s.state == StateClosed { return }
+    }
+    if atomic.LoadInt64(&s.inSeqNum) >= s.resendUntil { s.resendUntil = 0 }
+}
+
+func (s *UpstreamSession) processOrderedMessage(ctx context.Context, msg *fix.Message, seq int64) {
+    if msg.MsgType == fix.MsgTypeSequenceReset {
+        newSeqText, ok := msg.GetField(fix.TagNewSeqNo)
+        newSeq, err := strconv.ParseInt(newSeqText, 10, 64)
+        if !ok || err != nil || newSeq <= seq {
+            log.Error().Int64("seq", seq).Str("new_seq_no", newSeqText).Msg("Invalid upstream SequenceReset")
+            s.state = StateClosed
+            if s.conn != nil { _ = s.conn.Close() }
+            return
+        }
+        atomic.StoreInt64(&s.inSeqNum, newSeq-1)
+        for pendingSeq := range s.pendingMessages {
+            if pendingSeq < newSeq { delete(s.pendingMessages, pendingSeq) }
+        }
+    } else {
+        atomic.StoreInt64(&s.inSeqNum, seq)
+    }
+    in := atomic.LoadInt64(&s.inSeqNum)
     out := atomic.LoadInt64(&s.outSeqNum)
     if err := s.store.Save(s.senderCompID, s.targetCompID, in, out); err != nil {
         log.Error().Err(err).Msg("Failed to save sequence")
@@ -247,7 +367,10 @@ func (s *UpstreamSession) handleMessage(msg *fix.Message) {
         log.Info().Msg("Upstream logon successful")
         s.state = StateActive
         metrics.UpstreamSessionState.Set(1)
-        go s.heartbeatLoop()
+        go s.heartbeatLoop(ctx)
+        if s.onMsg != nil {
+            s.onMsg(msg)
+        }
     case fix.MsgTypeHeartbeat:
         // Reset timeout handled by read deadline
     case fix.MsgTypeTestRequest:
@@ -284,11 +407,16 @@ func (s *UpstreamSession) handleMessage(msg *fix.Message) {
     }
 }
 
-func (s *UpstreamSession) heartbeatLoop() {
+func (s *UpstreamSession) heartbeatLoop(ctx context.Context) {
     ticker := time.NewTicker(time.Duration(s.heartBtInt) * time.Second)
     defer ticker.Stop()
     
-    for range ticker.C {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+        }
         if s.state != StateActive {
             return
         }

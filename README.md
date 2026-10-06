@@ -7,6 +7,14 @@
 
 **Optimus** is a high-performance, FIX 4.4-native market data gateway and splitter designed specifically for PrimeXM pricing streams. It allows multiple downstream consumers to share a single canonical upstream PrimeXM pricing session, reducing costs and operational complexity.
 
+### PrimeXM single connection
+
+PrimeXM usually allows **one** FIX pricing session per account. **Optimus** is the process that keeps that **upstream** session (initiator to PrimeXM). Every other service (e.g. fix_streaming) connects as a **downstream** FIX initiator to optimus’s **acceptor** instead of opening extra PrimeXM sessions.
+
+**Downstream FIX identity:** On logon ack, optimus sends **SenderCompID** = `acceptor_sender` (see config). Set `acceptor_sender` to the **venue CompID** your clients already used as **TargetCompID (Tag 56)** toward PrimeXM, so existing clients only need to change **host/port** to reach optimus (same session ids as a direct PrimeXM connection). If you use a different gateway-only id, clients must update their TargetCompID.
+
+Upstream credentials (`upstream_sender`, `upstream_target`, `upstream_user`, `upstream_pass`) are the **gateway’s** PrimeXM session — distinct from per-client Comp IDs on the downstream side.
+
 ## Key Features
 
 - **Single Upstream Session**: Consolidates all downstream subscriptions into one upstream session.
@@ -38,14 +46,17 @@ go get github.com/youruser/optimus
 
 ### Configuration
 
-Create a `config.yaml` in the root directory:
+Create a `config.yaml` in the root directory (see [`config.yaml.example`](config.yaml.example)):
 
 ```yaml
 upstream_host: "pricing.primexm.com"
 upstream_port: 9879
+upstream_sender: "GW01"       # optimus → PrimeXM (Tags 49/56)
+upstream_target: "PXMD"
 upstream_user: "your_user"
 upstream_pass: "your_pass"
-listen_addr: "0.0.0.0:9878"
+listen_addr: "0.0.0.0:9878"   # downstream clients connect here (plain TCP)
+acceptor_sender: "PXMD"       # Tag 49 toward clients; use venue id to avoid client Comp ID changes
 ```
 
 Set via Environment Variables:
