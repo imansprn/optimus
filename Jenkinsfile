@@ -3,8 +3,8 @@ pipeline {
 
     environment {
         OVERRIDE_SERVICE_NAME   = 'optimus-gateway'
-        DEPLOY_HOST_DEV         = '10.200.4.23'
-        DEPLOY_HOST_PROD        = ''
+        DEPLOY_HOST_DEV         = "${OPTIMUS_HOST_DEV}"
+        DEPLOY_HOST_PROD        = "${OPTIMUS_HOST_PROD}"
         DEPLOY_USER             = 'halim'
         APP_DIR                 = '/home/halim/optimus'
         GITHUB_COMMIT_ID        = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
@@ -40,7 +40,9 @@ pipeline {
         }
 
         stage('Deploy Branch Development') {
-            when { branch 'development' }
+            when { 
+                expression { return env.GIT_BRANCH == "origin/development" }
+            }
             steps {
                 sh '''
                     set -e
@@ -54,7 +56,9 @@ pipeline {
         }
 
         stage('Deploy Branch Main') {
-            when { branch 'main' }
+            when { 
+                expression { return env.GIT_BRANCH == "origin/main" }
+            }
             steps {
                 sh '''
                     set -e
