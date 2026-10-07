@@ -33,7 +33,7 @@ func TestSplitFixMessage(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-    raw := []byte("8=FIX.4.4\x019=12\x0135=A\x0149=SNDR\x0110=196\x01")
+    raw := []byte("8=FIX.4.4\x019=13\x0135=A\x0149=SNDR\x0110=197\x01")
     msg, err := Parse(raw)
     if err != nil {
         t.Fatalf("Parse error: %v", err)

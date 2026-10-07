@@ -17,6 +17,7 @@ import (
 )
 
 type UpstreamSession struct {
+    ResetOnLogon bool
     conn         net.Conn
     host         string
     port         int
@@ -53,6 +54,7 @@ func NewUpstreamSession(host string, port int, sender, target, user, pass string
 		heartBt = 30
 	}
     return &UpstreamSession{
+        ResetOnLogon: true,
         host:         host,
         port:         port,
         dialTimeout:  dialTimeout,
@@ -132,7 +134,7 @@ func (s *UpstreamSession) connect(ctx context.Context) error {
     
     // Load sequences from store
     in, out, err := s.store.Load(s.senderCompID, s.targetCompID)
-    if err == nil && in > 0 {
+    if !s.ResetOnLogon && err == nil && in > 0 {
         atomic.StoreInt64(&s.inSeqNum, in)
         atomic.StoreInt64(&s.outSeqNum, out)
         log.Info().Int64("in", in).Int64("out", out).Msg("Restored session sequences")
@@ -153,7 +155,7 @@ func (s *UpstreamSession) connect(ctx context.Context) error {
     logon.AddField(fix.TagEncryptMethod, "0")
     logon.AddField(fix.TagHeartBtInt, strconv.Itoa(s.heartBtInt))
     
-    if in == 0 {
+    if s.ResetOnLogon || err != nil || in == 0 {
         logon.AddField(fix.TagResetSeqNumFlag, "Y")
     } else {
         logon.AddField(fix.TagResetSeqNumFlag, "N")
@@ -292,6 +294,20 @@ func (s *UpstreamSession) handleMessage(ctx context.Context, msg *fix.Message) {
         log.Error().Str("msg_type", msg.MsgType).Msg("Upstream message has invalid MsgSeqNum")
         s.state = StateClosed
         return
+    }
+    if msg.MsgType == fix.MsgTypeLogon && s.state == StateConnecting {
+        reset, _ := msg.GetField(fix.TagResetSeqNumFlag)
+        if reset == "Y" {
+            if seq != 1 {
+                log.Error().Int64("seq", seq).Msg("Reset Logon must use sequence 1")
+                s.state = StateClosed
+                return
+            }
+            atomic.StoreInt64(&s.inSeqNum, 0)
+            atomic.StoreInt64(&s.outSeqNum, 1)
+            clear(s.pendingMessages)
+            s.resendUntil = 0
+        }
     }
     previous := atomic.LoadInt64(&s.inSeqNum)
     expected := previous + 1
