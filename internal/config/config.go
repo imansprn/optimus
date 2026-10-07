@@ -8,6 +8,7 @@ import (
 )
 
 type Config struct {
+    UpstreamResetOnLogon bool `mapstructure:"upstream_reset_on_logon"`
     UpstreamHost    string `mapstructure:"upstream_host"`
     UpstreamPort    int    `mapstructure:"upstream_port"`
     UpstreamSender  string `mapstructure:"upstream_sender"`
@@ -33,6 +34,7 @@ func Load() *Config {
     v.SetDefault("upstream_sender", "GW01")
     v.SetDefault("upstream_target", "PXMD")
     v.SetDefault("upstream_dial_timeout_seconds", 10)
+    v.SetDefault("upstream_reset_on_logon", true)
     v.SetDefault("listen_addr", "0.0.0.0:9878")
     v.SetDefault("acceptor_sender", "PXMD")
     v.SetDefault("log_level", "info")

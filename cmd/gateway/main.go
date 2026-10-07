@@ -44,6 +44,7 @@ func main() {
     )
 
     // Wire upstream into router
+    upstream.ResetOnLogon = cfg.UpstreamResetOnLogon
     r.SetUpstream(upstream)
 
     // 3. Create Downstream Acceptor
