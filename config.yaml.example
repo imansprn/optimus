@@ -6,6 +6,7 @@
 # Upstream PrimeXM pricing session settings (the single venue connection)
 upstream_host: "pricing.primexm.com"
 upstream_port: 9879
+upstream_reset_on_logon: true
 upstream_sender: "GW01"     # Provided by PrimeXM — optimus Tag 49 toward PrimeXM
 upstream_target: "PXMD"     # Provided by PrimeXM — optimus Tag 56 toward PrimeXM
 upstream_user: "your_user"  # Provided by PrimeXM (Tag 553)
