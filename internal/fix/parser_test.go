@@ -33,18 +33,32 @@ func TestSplitFixMessage(t *testing.T) {
 }
 
 func TestParse(t *testing.T) {
-    raw := []byte("8=FIX.4.4\x019=13\x0135=A\x0149=SNDR\x0110=197\x01")
+    original := NewMessage(MsgTypeLogon)
+    original.AddField(TagSenderCompID, "SNDR")
+    raw := Serialize(original)
+
     msg, err := Parse(raw)
     if err != nil {
         t.Fatalf("Parse error: %v", err)
     }
     
-    if msg.MsgType != "A" {
+    if msg.MsgType != MsgTypeLogon {
         t.Errorf("Expected MsgType A, got %s", msg.MsgType)
     }
     
-    val, _ := msg.GetField(49)
+    val, _ := msg.GetField(TagSenderCompID)
     if val != "SNDR" {
         t.Errorf("Expected SNDR, got %s", val)
+    }
+}
+
+func TestParseRejectsIncorrectBodyLength(t *testing.T) {
+    original := NewMessage(MsgTypeLogon)
+    original.AddField(TagSenderCompID, "SNDR")
+    raw := Serialize(original)
+    raw = bytes.Replace(raw, []byte("\x019=13\x01"), []byte("\x019=12\x01"), 1)
+
+    if _, err := Parse(raw); err == nil {
+        t.Fatal("Expected invalid body length to be rejected")
     }
 }

@@ -4,6 +4,8 @@ import (
     "context"
     "fmt"
     "net"
+    "os"
+    "path/filepath"
     "github.com/imansprn/optimus/internal/fix"
     "github.com/imansprn/optimus/internal/router"
     "github.com/imansprn/optimus/internal/session"
@@ -54,7 +56,11 @@ func TestEndToEnd(t *testing.T) {
 
     // 2. Start Gateway
     r := router.NewRouter()
-    upstream := session.NewUpstreamSession("127.0.0.1", 9999, "GW01", "PXMD", "user", "pass", 30, 2*time.Second, r.OnUpstreamMessage)
+    senderCompID := fmt.Sprintf("GW01_%d", time.Now().UnixNano())
+    t.Cleanup(func() {
+        _ = os.Remove(filepath.Join("data", senderCompID+"_PXMD.json"))
+    })
+    upstream := session.NewUpstreamSession("127.0.0.1", 9999, senderCompID, "PXMD", "user", "pass", 30, 2*time.Second, r.OnUpstreamMessage)
     r.SetUpstream(upstream)
     
     acceptor := session.NewAcceptor(gwAddr, "GW_GATEWAY", nil, r.OnClientSubscribe)
