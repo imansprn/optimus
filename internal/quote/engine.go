@@ -36,6 +36,7 @@ func (e *Engine) FanOut(symbol string, book *QuoteBook, subscribers []ClientSub)
 		// Follow the FIX dictionary order within each quote entry.
 		msg.AddField(fix.TagQuoteSetID, sub.ClientReqID)
 		msg.AddField(fix.TagNoQuoteEntries, strconv.Itoa(len(entries)))
+
 		for _, entry := range entries {
 			msg.AddField(fix.TagQuoteEntryID, strconv.Itoa(entry.QuoteEntryID))
 			msg.AddField(fix.TagBidSize, strconv.FormatFloat(entry.BidSize, 'f', 2, 64))
@@ -46,7 +47,7 @@ func (e *Engine) FanOut(symbol string, book *QuoteBook, subscribers []ClientSub)
 
 		metrics.FanoutTotal.WithLabelValues(symbol).Inc()
 		log.Trace().Str("symbol", symbol).Str("client", sub.Session.SenderCompID).Msg("Fanning out Mass Quote")
-		sub.Session.Send(msg)
+		sub.Session.SendLatestPrice(symbol+"|"+sub.ClientReqID, msg)
 	}
 }
 
@@ -82,6 +83,6 @@ func (e *Engine) EmitSnapshot(symbol string, book *QuoteBook, subscribers []Clie
 		}
 
 		log.Trace().Str("symbol", symbol).Str("client", sub.Session.SenderCompID).Msg("Emitting Snapshot")
-		sub.Session.Send(msg)
+		sub.Session.SendLatestPrice(symbol+"|"+sub.ClientReqID, msg)
 	}
 }
