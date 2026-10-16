@@ -1,214 +1,240 @@
 package session
 
 import (
-    "bufio"
-    "context"
+	"bufio"
+	"context"
 	"errors"
+	"github.com/imansprn/optimus/internal/fix"
+	"github.com/imansprn/optimus/internal/metrics"
 	"io"
 	"net"
-    "github.com/imansprn/optimus/internal/fix"
-    "github.com/imansprn/optimus/internal/metrics"
-    "strconv"
-    "sync"
-    "sync/atomic"
-    "time"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 
-    "github.com/google/uuid"
-    "github.com/rs/zerolog"
-    "github.com/rs/zerolog/log"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 type ClientSession struct {
-    ID            string
-    SenderCompID  string
-    TargetCompID  string
-    AcceptorCompID string
-    conn          net.Conn
-    outboundCh    chan []byte
-    outSeqNum     int64
-    heartBtInt    int
-    lastRecv      time.Time
-    state         SessionState
-    cancel        context.CancelFunc
-    logger        zerolog.Logger
-    // closingAfterLogout is set before cancel when the client sends Logout, so the
-    // subsequent read error from closing the socket is not logged as a failure.
-    closingAfterLogout atomic.Bool
+	ID             string
+	SenderCompID   string
+	TargetCompID   string
+	AcceptorCompID string
+	conn           net.Conn
+	outboundCh     chan []byte
+	sendMu         sync.Mutex
+	priceMu        sync.Mutex
+	pendingPrices  map[string]*fix.Message
+	priceWake      chan struct{}
+	outSeqNum      int64
+	heartBtInt     int
+	lastRecv       time.Time
+	state          SessionState
+	cancel         context.CancelFunc
+	logger         zerolog.Logger
+	// closingAfterLogout is set before cancel when the client sends Logout, so the
+	// subsequent read error from closing the socket is not logged as a failure.
+	closingAfterLogout atomic.Bool
 }
 
 type Acceptor struct {
-    listenAddr    string
-    senderCompID  string
-    sessions      sync.Map // string -> *ClientSession
-    onMarketData  func(*ClientSession, *fix.Message)
-    onSubscribe   func(*ClientSession, *fix.Message)
-    onDisconnect  func(*ClientSession)
+	listenAddr   string
+	senderCompID string
+	sessions     sync.Map // string -> *ClientSession
+	onMarketData func(*ClientSession, *fix.Message)
+	onSubscribe  func(*ClientSession, *fix.Message)
+	onDisconnect func(*ClientSession)
 }
 
 // SetOnDisconnect registers cleanup for subscriptions owned by a client session.
 func (a *Acceptor) SetOnDisconnect(fn func(*ClientSession)) {
-    a.onDisconnect = fn
+	a.onDisconnect = fn
 }
 
 func NewAcceptor(addr, sender string, onMD, onSub func(*ClientSession, *fix.Message)) *Acceptor {
-    return &Acceptor{
-        listenAddr:   addr,
-        senderCompID: sender,
-        onMarketData: onMD,
-        onSubscribe:  onSub,
-    }
+	return &Acceptor{
+		listenAddr:   addr,
+		senderCompID: sender,
+		onMarketData: onMD,
+		onSubscribe:  onSub,
+	}
 }
 
 func (a *Acceptor) Start(ctx context.Context) error {
-    ln, err := net.Listen("tcp", a.listenAddr)
-    if err != nil {
-        return err
-    }
-    log.Info().Str("addr", a.listenAddr).Msg("Acceptor listening")
+	ln, err := net.Listen("tcp", a.listenAddr)
+	if err != nil {
+		return err
+	}
+	log.Info().Str("addr", a.listenAddr).Msg("Acceptor listening")
 
-    go func() {
-        <-ctx.Done()
-        ln.Close()
-    }()
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
 
-    for {
-        conn, err := ln.Accept()
-        if err != nil {
-            select {
-            case <-ctx.Done():
-                return nil
-            default:
-                log.Error().Err(err).Msg("Accept error")
-                continue
-            }
-        }
-        go a.handleConnection(ctx, conn)
-    }
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				log.Error().Err(err).Msg("Accept error")
+				continue
+			}
+		}
+		go a.handleConnection(ctx, conn)
+	}
 }
 
 func (a *Acceptor) handleConnection(ctx context.Context, conn net.Conn) {
-    sessionCtx, cancel := context.WithCancel(ctx)
-    defer cancel()
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-    s := &ClientSession{
-        ID:           uuid.New().String(),
-        conn:         conn,
-        outboundCh:   make(chan []byte, 8192),
-        state:        StateConnecting,
-        cancel:       cancel,
-        logger:       log.With().Str("session_id", "").Logger(), // Will update after logon
-        AcceptorCompID: a.senderCompID,
-    }
+	s := &ClientSession{
+		ID:             uuid.New().String(),
+		conn:           conn,
+		outboundCh:     make(chan []byte, 8192),
+		pendingPrices:  make(map[string]*fix.Message),
+		priceWake:      make(chan struct{}, 1),
+		state:          StateConnecting,
+		cancel:         cancel,
+		logger:         log.With().Str("session_id", "").Logger(), // Will update after logon
+		AcceptorCompID: a.senderCompID,
+	}
 
-    go s.writeLoop(sessionCtx)
+	go s.writeLoop(sessionCtx)
 
-    scanner := bufio.NewScanner(conn)
-    scanner.Split(fix.SplitFixMessage)
-    scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner := bufio.NewScanner(conn)
+	scanner.Split(fix.SplitFixMessage)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 
-    // Read first message (Logon)
-    if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-        log.Error().Err(err).Msg("Failed to set read deadline")
-        conn.Close()
-        return
-    }
-    if !scanner.Scan() {
-        if err := scanner.Err(); err != nil {
-            log.Error().Err(err).Msg("Initial read error")
-        } else {
-            log.Warn().Msg("Initial read: client disconnected before logon")
-        }
-        conn.Close()
-        return
-    }
+	// Read first message (Logon)
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Error().Err(err).Msg("Failed to set read deadline")
+		conn.Close()
+		return
+	}
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			log.Error().Err(err).Msg("Initial read error")
+		} else {
+			log.Warn().Msg("Initial read: client disconnected before logon")
+		}
+		conn.Close()
+		return
+	}
 
-    msg, err := fix.Parse(scanner.Bytes())
-    if err != nil {
-        log.Error().Err(err).Msg("Initial parse error")
-        conn.Close()
-        return
-    }
+	msg, err := fix.Parse(scanner.Bytes())
+	if err != nil {
+		log.Error().Err(err).Msg("Initial parse error")
+		conn.Close()
+		return
+	}
 
-    if msg.MsgType != fix.MsgTypeLogon {
-        log.Warn().Str("type", msg.MsgType).Msg("First message must be Logon")
-        conn.Close()
-        return
-    }
+	if msg.MsgType != fix.MsgTypeLogon {
+		log.Warn().Str("type", msg.MsgType).Msg("First message must be Logon")
+		conn.Close()
+		return
+	}
 
-    // Basic auth (in v1 we accept all)
-    s.SenderCompID, _ = msg.GetField(fix.TagSenderCompID)
-    s.TargetCompID, _ = msg.GetField(fix.TagTargetCompID)
-    hbt, _ := msg.GetField(fix.TagHeartBtInt)
-    s.heartBtInt, _ = strconv.Atoi(hbt)
-    if s.heartBtInt <= 0 {
-        s.heartBtInt = 30
-    }
-    resetSeqNum, _ := msg.GetField(fix.TagResetSeqNumFlag)
+	// Basic auth (in v1 we accept all)
+	s.SenderCompID, _ = msg.GetField(fix.TagSenderCompID)
+	s.TargetCompID, _ = msg.GetField(fix.TagTargetCompID)
+	hbt, _ := msg.GetField(fix.TagHeartBtInt)
+	s.heartBtInt, _ = strconv.Atoi(hbt)
+	if s.heartBtInt <= 0 {
+		s.heartBtInt = 30
+	}
+	resetSeqNum, _ := msg.GetField(fix.TagResetSeqNumFlag)
 
-    s.logger = log.With().Str("client", s.SenderCompID).Str("id", s.ID).Logger()
-    s.state = StateActive
-    a.sessions.Store(s.ID, s)
-    metrics.DownstreamSessions.Inc()
+	s.logger = log.With().Str("client", s.SenderCompID).Str("id", s.ID).Logger()
+	s.state = StateActive
+	a.sessions.Store(s.ID, s)
+	metrics.DownstreamSessions.Inc()
 
-    defer func() {
-        if a.onDisconnect != nil {
-            a.onDisconnect(s)
-        }
-        a.sessions.Delete(s.ID)
-        metrics.DownstreamSessions.Dec()
-    }()
+	defer func() {
+		if a.onDisconnect != nil {
+			a.onDisconnect(s)
+		}
+		a.sessions.Delete(s.ID)
+		metrics.DownstreamSessions.Dec()
+	}()
 
-    s.logger.Info().Msg("Client logon successful")
+	s.logger.Info().Msg("Client logon successful")
 
-    // Respond with Logon
-    ack := fix.NewMessage(fix.MsgTypeLogon)
-    ack.AddField(fix.TagSenderCompID, a.senderCompID)
-    ack.AddField(fix.TagTargetCompID, s.SenderCompID)
-    ack.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&s.outSeqNum, 1), 10))
-    ack.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
-    ack.AddField(fix.TagEncryptMethod, "0")
-    ack.AddField(fix.TagHeartBtInt, strconv.Itoa(s.heartBtInt))
-    if resetSeqNum == "Y" {
-        ack.AddField(fix.TagResetSeqNumFlag, "Y")
-    }
-    s.Send(ack)
+	// Respond with Logon
+	ack := fix.NewMessage(fix.MsgTypeLogon)
+	ack.AddField(fix.TagSenderCompID, a.senderCompID)
+	ack.AddField(fix.TagTargetCompID, s.SenderCompID)
+	ack.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&s.outSeqNum, 1), 10))
+	ack.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
+	ack.AddField(fix.TagEncryptMethod, "0")
+	ack.AddField(fix.TagHeartBtInt, strconv.Itoa(s.heartBtInt))
+	if resetSeqNum == "Y" {
+		ack.AddField(fix.TagResetSeqNumFlag, "Y")
+	}
+	s.Send(ack)
 
-    go s.heartbeatLoop(sessionCtx)
+	go s.heartbeatLoop(sessionCtx)
 
-    // Main read loop. Set the deadline before blocking in Scan so a quiet client
-    // gets the full negotiated heartbeat interval after Logon.
-    for {
-        if err := conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
-            s.logger.Error().Err(err).Msg("Failed to set read deadline")
-            s.cancel()
-            return
-        }
-        if !scanner.Scan() {
-            break
-        }
-        data := scanner.Bytes()
-        s.logger.Trace().Int("len", len(data)).Msg("Raw data received from client")
+	// Main read loop. Set the deadline before blocking in Scan so a quiet client
+	// gets the full negotiated heartbeat interval after Logon.
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(time.Duration(s.heartBtInt) * 2 * time.Second)); err != nil {
+			s.logger.Error().Err(err).Msg("Failed to set read deadline")
+			s.cancel()
+			return
+		}
+		if !scanner.Scan() {
+			break
+		}
+		data := scanner.Bytes()
+		s.logger.Trace().Int("len", len(data)).Msg("Raw data received from client")
 
-        msg, err := fix.Parse(data)
-        if err != nil {
-            s.logger.Error().Err(err).Msg("Client parse error")
-            continue
-        }
+		msg, err := fix.Parse(data)
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Client parse error")
+			continue
+		}
 
-        s.lastRecv = time.Now()
-        a.handleClientMessage(s, msg)
-    }
+		s.lastRecv = time.Now()
+		a.handleClientMessage(s, msg)
+	}
 
-    if err := scanner.Err(); err != nil {
-        if s.closingAfterLogout.Load() && errors.Is(err, net.ErrClosed) {
-            s.logger.Debug().Msg("Client read closed after logout")
-        } else {
-            s.logger.Error().Err(err).Msg("Client read error")
-        }
-    }
+	if err := scanner.Err(); err != nil {
+		if s.closingAfterLogout.Load() && errors.Is(err, net.ErrClosed) {
+			s.logger.Debug().Msg("Client read closed after logout")
+		} else {
+			s.logger.Error().Err(err).Msg("Client read error")
+		}
+	}
+}
+
+// SendLatestPrice replaces unsent market data for the same subscription.
+// FIX sequence numbers are assigned only when the writer takes the latest value.
+func (s *ClientSession) SendLatestPrice(key string, msg *fix.Message) {
+	s.priceMu.Lock()
+	if s.pendingPrices == nil {
+		s.pendingPrices = make(map[string]*fix.Message)
+	}
+	s.pendingPrices[key] = msg
+	if s.priceWake == nil {
+		s.priceWake = make(chan struct{}, 1)
+	}
+	select {
+	case s.priceWake <- struct{}{}:
+	default:
+	}
+	s.priceMu.Unlock()
 }
 
 func (s *ClientSession) Send(msg *fix.Message) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	// If the message was built without session header fields (e.g. MassQuote
 	// from the engine), inject them here so downstream clients receive a valid
 	// FIX message with 49/56/34/52.
@@ -239,37 +265,49 @@ func (s *ClientSession) Send(msg *fix.Message) {
 }
 
 func (s *ClientSession) SendRaw(data []byte) {
-    select {
-    case s.outboundCh <- data:
-        s.logger.Trace().Int("len", len(data)).Msg("Message queued for client")
-    default:
-        s.logger.Error().Int("queue_capacity", cap(s.outboundCh)).Msg("Outbound channel full; disconnecting slow client to avoid FIX sequence gaps")
+	select {
+	case s.outboundCh <- data:
+		s.logger.Trace().Int("len", len(data)).Msg("Message queued for client")
+	default:
+		s.logger.Error().Int("queue_capacity", cap(s.outboundCh)).Msg("Outbound channel full; disconnecting slow client to avoid FIX sequence gaps")
 		metrics.SlowClientDrops.Inc()
-        s.cancel()
-        _ = s.conn.Close()
-    }
+		s.cancel()
+		_ = s.conn.Close()
+	}
+}
+
+func (s *ClientSession) flushLatestPrices() {
+	s.priceMu.Lock()
+	pending := s.pendingPrices
+	s.pendingPrices = make(map[string]*fix.Message)
+	s.priceMu.Unlock()
+	for _, msg := range pending {
+		s.Send(msg)
+	}
 }
 
 func (s *ClientSession) writeLoop(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
-            s.conn.Close()
-            return
-        case data := <-s.outboundCh:
-            if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-                s.logger.Error().Err(err).Msg("Failed to set write deadline")
-                s.cancel()
-                return
-            }
-            err := writeFull(s.conn, data)
-            if err != nil {
-                s.logger.Error().Err(err).Msg("Client write error")
-                s.cancel()
-                return
-            }
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			s.conn.Close()
+			return
+		case <-s.priceWake:
+			s.flushLatestPrices()
+		case data := <-s.outboundCh:
+			if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				s.logger.Error().Err(err).Msg("Failed to set write deadline")
+				s.cancel()
+				return
+			}
+			err := writeFull(s.conn, data)
+			if err != nil {
+				s.logger.Error().Err(err).Msg("Client write error")
+				s.cancel()
+				return
+			}
+		}
+	}
 }
 
 func writeFull(w io.Writer, data []byte) error {
@@ -289,42 +327,42 @@ func writeFull(w io.Writer, data []byte) error {
 }
 
 func (s *ClientSession) heartbeatLoop(ctx context.Context) {
-    ticker := time.NewTicker(time.Duration(s.heartBtInt) * time.Second)
-    defer ticker.Stop()
+	ticker := time.NewTicker(time.Duration(s.heartBtInt) * time.Second)
+	defer ticker.Stop()
 
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            hb := fix.NewMessage(fix.MsgTypeHeartbeat)
-            hb.AddField(fix.TagSenderCompID, s.AcceptorCompID)
-            hb.AddField(fix.TagTargetCompID, s.SenderCompID)
-            hb.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&s.outSeqNum, 1), 10))
-            hb.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
-            s.Send(hb)
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			hb := fix.NewMessage(fix.MsgTypeHeartbeat)
+			hb.AddField(fix.TagSenderCompID, s.AcceptorCompID)
+			hb.AddField(fix.TagTargetCompID, s.SenderCompID)
+			hb.AddField(fix.TagMsgSeqNum, strconv.FormatInt(atomic.AddInt64(&s.outSeqNum, 1), 10))
+			hb.AddField(fix.TagSendingTime, time.Now().UTC().Format("20060102-15:04:05.000"))
+			s.Send(hb)
+		}
+	}
 }
 
 func (a *Acceptor) handleClientMessage(s *ClientSession, msg *fix.Message) {
-    switch msg.MsgType {
-    case fix.MsgTypeHeartbeat:
-        // OK
-    case fix.MsgTypeTestRequest:
-        tid, _ := msg.GetField(fix.TagTestReqID)
-        ack := fix.NewMessage(fix.MsgTypeHeartbeat)
-        ack.AddField(fix.TagTestReqID, tid)
-        s.Send(ack)
-    case fix.MsgTypeMarketDataRequest:
-        if a.onSubscribe != nil {
-            a.onSubscribe(s, msg)
-        }
-    case fix.MsgTypeLogout:
-        s.logger.Info().Msg("Client logout")
-        s.closingAfterLogout.Store(true)
-        s.cancel()
-    default:
-        s.logger.Debug().Str("type", msg.MsgType).Msg("Unhandled client message")
-    }
+	switch msg.MsgType {
+	case fix.MsgTypeHeartbeat:
+		// OK
+	case fix.MsgTypeTestRequest:
+		tid, _ := msg.GetField(fix.TagTestReqID)
+		ack := fix.NewMessage(fix.MsgTypeHeartbeat)
+		ack.AddField(fix.TagTestReqID, tid)
+		s.Send(ack)
+	case fix.MsgTypeMarketDataRequest:
+		if a.onSubscribe != nil {
+			a.onSubscribe(s, msg)
+		}
+	case fix.MsgTypeLogout:
+		s.logger.Info().Msg("Client logout")
+		s.closingAfterLogout.Store(true)
+		s.cancel()
+	default:
+		s.logger.Debug().Str("type", msg.MsgType).Msg("Unhandled client message")
+	}
 }
